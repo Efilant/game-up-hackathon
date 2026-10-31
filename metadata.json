@@ -1,0 +1,8 @@
+{
+  "name": "FELAKET BENİM",
+  "description": "FELAKET BENİM — Önce sistemi zorla. Sonra onu kurtar. GameUP Türkiye 2026 İklim Oyunu.",
+  "prompt": "FELAKET BENİM — Önce sistemi zorla. Sonra onu kurtar.",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
