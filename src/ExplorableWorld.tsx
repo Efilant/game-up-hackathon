@@ -1,10 +1,9 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo, type PointerEvent as ReactPointerEvent } from 'react';
 import {
   Compass,
   Volume2,
   VolumeX,
   ArrowLeft,
-  Shield,
   CheckCircle,
   AlertTriangle,
   Navigation,
@@ -13,9 +12,10 @@ import {
   User,
 } from 'lucide-react';
 import { gameAudio } from './audio';
-import { BUDGET, DEFENSES, type DefenseId } from './simulation';
+import { BUDGET, DEFENSES, type DefenseId, type DistrictId } from './simulation';
 import {
   createInitialSpatialState,
+  FIXED_SIMULATION_STEP_SECONDS,
   stepSpatialSimulation,
   type SpatialSimulationState,
 } from './spatialSimulation';
@@ -36,17 +36,18 @@ import {
   drawPixelMiraNPC,
   drawPixelAras,
   drawPixelQuestWaypoint,
-  drawGoldenQuestTrail,
+  drawPixelWeatherOverlay,
   type WorldRenderContext,
 } from './pixelWorldRenderer';
 import {
   findNavRoute,
-  getOffScreenIndicator,
+  calculateCompassBearing,
   getEkoContextualHint,
   calculateDistanceMeters,
+  isNavRouteTraversable,
+  pointInFloodedRoadZone,
   type Point2D,
   type ObstacleBox,
-  type OffScreenIndicator,
 } from './navigation';
 import {
   createInitialAmbientCitizens,
@@ -54,15 +55,55 @@ import {
   drawPixelCitizen,
   type AmbientCitizen,
 } from './ambientCitizens';
+import {
+  canPlayerOccupy,
+  getMovementInput,
+  isEditableTarget,
+  movePlayer,
+  pointInBlockedTerrain,
+  type PlayerMotionState,
+} from './playerMovement';
+import { WORLD_TERRAIN_MASK } from './worldTerrain';
+import {
+  advanceWeather,
+  createWeatherPhaseState,
+  createWeatherState,
+  startStormWeather,
+  weatherPhaseLabel,
+  type WeatherState,
+} from './weather';
+import {
+  ACHIEVEMENTS,
+  evaluateChapterOutcome,
+  getAchievementUnlocks,
+  mergeChapterRecord,
+  type AchievementId,
+  type AchievementRecord,
+  type ChapterOutcome,
+  type ChapterRecord,
+  type GameMode,
+} from './chapterProgress';
+import { migrateQuestSave } from './saveMigration';
+import { CITY_DISTRICTS, getCityDistrictAt } from './cityDistricts';
+import { BRAND_ASSETS, getAchievementAsset } from './branding';
+import { BrandLogo } from './BrandLogo';
+import {
+  CLIMATE_SOLUTIONS,
+  getDiscoveryProgress,
+  getSolution,
+  getSolutionState,
+} from './solutionRegistry';
 
 interface ExplorableWorldProps {
   onBackToMenu: () => void;
-  onOpenStrategy?: () => void;
   muted: boolean;
   onToggleMute: () => void;
 }
 
 export type HeroId = 'female' | 'male';
+const WORLD_WIDTH = 2200;
+const WORLD_HEIGHT = 1500;
+const INITIAL_PLAYER_POSITION = { x: 700, y: 620 };
 
 export interface HeroProfile {
   id: HeroId;
@@ -95,6 +136,39 @@ export const HEROES: Record<HeroId, HeroProfile> = {
   },
 };
 
+function getOutcomePresentation(outcome: ChapterOutcome) {
+  if (!outcome.success) {
+    return {
+      title: 'BU KEZ YETİŞEMEDİK',
+      subtitle: 'Bu kez şehri koruyamadık. Ama yeniden deneyebilirsin!',
+      detail: 'Tehlikeli bölgeler hâlâ kapanmış durumda; yeniden deneyerek daha iyi bir müdahale planı kurabilirsin.',
+      tone: 'failure',
+    } as const;
+  }
+  if (outcome.stars === 3) {
+    return {
+      title: 'ŞEHRİN YARINI SENİNLE DEĞİŞTİ!',
+      subtitle: 'Harika! Şehrin yarınını korumayı başardın.',
+      detail: 'Hastane erişimi korunuyor, su seviyesi toparlanıyor ve şehir yeniden nefes alıyor.',
+      tone: 'three-star',
+    } as const;
+  }
+  if (outcome.stars === 2) {
+    return {
+      title: 'ŞEHİR YENİDEN NEFES ALIYOR',
+      subtitle: 'Doğru adımlar attın; iyileşme başladı.',
+      detail: 'Hastane erişimi açık, ancak bazı taşkın izleri ve kırılgan noktalar hâlâ görünür.',
+      tone: 'success',
+    } as const;
+  }
+  return {
+    title: 'ŞEHİR TOPARLANMAYA BAŞLADI',
+    subtitle: 'Zorlu bir mücadeleydi.',
+    detail: 'Hastane erişimi geri geldi; ekipler kalan hasarı gidermek için çalışıyor.',
+    tone: 'partial',
+  } as const;
+}
+
 interface Obstacle {
   x: number;
   y: number;
@@ -117,11 +191,64 @@ interface InteractionPoint {
     | 'flood_observation'
     | 'sponge_site'
     | 'retrofit_site'
+    | 'warning_site'
+    | 'seawall_site'
     | 'road_inspection'
     | 'eko_terminal'
     | 'hospital';
   defenseId?: DefenseId;
 }
+
+const HOLD_INTERACTION_DURATION_MS = 900;
+
+// Default lower-case conversion turns Turkish capital İ into "i̇" (i plus a
+// combining dot). Asset filenames are ASCII, so map dialogue speakers
+// explicitly instead of deriving paths from locale-sensitive text.
+function getSpeakerAssetKey(speaker: string) {
+  return {
+    'MİRA': 'mira',
+    'ARAS': 'aras',
+    'EKO': 'eko',
+    'DENİZ': 'deniz',
+    'BARIŞ': 'baris',
+  }[speaker] ?? speaker.toLowerCase();
+}
+
+function requiresHoldToInteract(point: InteractionPoint | null) {
+  if (!point) return false;
+  return point.type === 'drainage'
+    || point.type === 'sponge_site'
+    || point.type === 'retrofit_site'
+    || point.type === 'warning_site'
+    || point.type === 'seawall_site';
+}
+
+const DEFENSE_GUIDANCE: Record<DefenseId, {
+  effect: string;
+  effective: string;
+  limit: string;
+}> = {
+  'uyarı': {
+    effect: 'Siren ve sensörlerle mahalle ekiplerine zaman kazandırır.',
+    effective: 'Şehir geneli güvenlik ve tahliye hazırlığı.',
+    limit: 'Su derinliğini veya fiziksel hasarı tek başına azaltmaz.',
+  },
+  'sünger': {
+    effect: 'Yağmur bahçesi ve geçirgen zeminle yüzey akışını tutar.',
+    effective: 'Yamaç havzası ve hastane yolunun su yükü.',
+    limit: 'Kapasitesi sınırlıdır; aşırı yağışta dolabilir ve etkisi kademeli oluşur.',
+  },
+  'set': {
+    effect: 'Kıyı hattında denizden gelen ters akışı ve dalga taşmasını keser.',
+    effective: 'Liman ve kıyı mahallesi.',
+    limit: 'Yamaçtan gelen hastane yolu taşkınını doğrudan çözmez.',
+  },
+  'dönüşüm': {
+    effect: 'Kritik yapıları ve tahliye rotalarını güçlendirir.',
+    effective: 'Hastane yolu ve riskli yapı bağlantıları.',
+    limit: 'Sünger Kent kadar yüzey suyunu tutmaz; bütçesi daha yüksektir.',
+  },
+};
 
 export type QuestStepId = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 
@@ -175,11 +302,11 @@ const QUEST_STEPS: Record<QuestStepId, QuestStepInfo> = {
   5: {
     step: 5,
     kicker: 'GÖREV 5/7',
-    title: 'Savunma İnşa Et',
-    description: 'Kuzey terastaki patikadan Sünger Kent sahasına çık ve su tutma göletini inşa et.',
+    title: 'Savunma Planını Oluştur',
+    description: 'Şehir Planı’nı aç, araştırdığın çözümleri karşılaştır ve bütçene uygun stratejiyi onayla.',
     targetX: 1160,
     targetY: 340,
-    targetLabel: 'SÜNGER KENT SAHASI',
+    targetLabel: 'ŞEHİR PLANI / ÇÖZÜM SAHALARI',
   },
   6: {
     step: 6,
@@ -203,24 +330,28 @@ const QUEST_STEPS: Record<QuestStepId, QuestStepInfo> = {
 
 export function ExplorableWorld({
   onBackToMenu,
-  onOpenStrategy,
   muted,
   onToggleMute,
 }: ExplorableWorldProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
+  const getWorldCanvasSize = () => {
+    const hudHeight = window.matchMedia('(max-width: 768px)').matches ? 60 : 88;
+    return {
+      width: window.innerWidth,
+      height: Math.max(320, window.innerHeight - hudHeight),
+    };
+  };
+
   // Ekran Boyutu (Responsive Resize)
   const [canvasSize, setCanvasSize] = useState({
     width: typeof window !== 'undefined' ? window.innerWidth : 1280,
-    height: typeof window !== 'undefined' ? window.innerHeight : 720,
+    height: typeof window !== 'undefined' ? Math.max(320, window.innerHeight - (window.matchMedia('(max-width: 768px)').matches ? 60 : 88)) : 632,
   });
 
   useEffect(() => {
     const handleResize = () => {
-      setCanvasSize({
-        width: window.innerWidth,
-        height: window.innerHeight,
-      });
+      setCanvasSize(getWorldCanvasSize());
     };
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
@@ -235,12 +366,40 @@ export function ExplorableWorld({
     return 'female';
   });
   const [showHeroModal, setShowHeroModal] = useState(false);
+  const [showCompass, setShowCompass] = useState(() => {
+    try {
+      return localStorage.getItem('felaket_benim_compass_visible') !== 'false';
+    } catch (_) {
+      return true;
+    }
+  });
   const [chapterWon, setChapterWon] = useState(false);
+  const [chapterOutcome, setChapterOutcome] = useState<ChapterOutcome | null>(null);
+  const [endingVisible, setEndingVisible] = useState(false);
+  const [endingNewBadges, setEndingNewBadges] = useState<AchievementId[]>([]);
+  const [gameMode, setGameMode] = useState<GameMode>(() => {
+    try {
+      return localStorage.getItem('sehrin_yarini_mode') === 'adventure' ? 'adventure' : 'relaxed';
+    } catch (_) {
+      return 'relaxed';
+    }
+  });
+  const [stormElapsedSeconds, setStormElapsedSeconds] = useState(0);
+  const [rescueCount, setRescueCount] = useState(0);
+  const [inspectedLocations, setInspectedLocations] = useState(0);
+  const [hadRoadClosure, setHadRoadClosure] = useState(false);
+  const [chapterRecord, setChapterRecord] = useState<ChapterRecord | null>(null);
+  const [achievements, setAchievements] = useState<Partial<Record<AchievementId, AchievementRecord>>>({});
+  const [achievementNotice, setAchievementNotice] = useState<AchievementId | null>(null);
+  const [currentDistrictId, setCurrentDistrictId] = useState<DistrictId>(() => getCityDistrictAt(INITIAL_PLAYER_POSITION.x, INITIAL_PLAYER_POSITION.y).id);
+  const [discoveredDistricts, setDiscoveredDistricts] = useState<Set<DistrictId>>(
+    () => new Set([getCityDistrictAt(INITIAL_PLAYER_POSITION.x, INITIAL_PLAYER_POSITION.y).id]),
+  );
+  const [isPaused, setIsPaused] = useState(false);
 
   // Oyuncu Karakteri (Seçilen Kahraman)
-  const [player, setPlayer] = useState({
-    x: 650,
-    y: 560,
+  const [player, setPlayer] = useState<PlayerMotionState>({
+    ...INITIAL_PLAYER_POSITION,
     vx: 0,
     vy: 0,
     facing: 'up' as 'down' | 'up' | 'left' | 'right',
@@ -250,7 +409,14 @@ export function ExplorableWorld({
 
   const [activeDefenses, setActiveDefenses] = useState<DefenseId[]>([]);
   const [budgetUsed, setBudgetUsed] = useState(0);
+  const [discoveredSolutions, setDiscoveredSolutions] = useState<DefenseId[]>([]);
+  const [investigatedSolutions, setInvestigatedSolutions] = useState<DefenseId[]>([]);
+  const [planningOpen, setPlanningOpen] = useState(false);
+  const [pendingPlan, setPendingPlan] = useState<DefenseId[]>([]);
+  const [planConfirmed, setPlanConfirmed] = useState(false);
   const [nearbyInteraction, setNearbyInteraction] = useState<InteractionPoint | null>(null);
+  const [interactionHold, setInteractionHold] = useState<{ pointId: string; progress: number } | null>(null);
+  const interactionHoldRef = useRef<{ pointId: string; startedAt: number; timer: number } | null>(null);
 
   // Yaşayan Şehir Sakinleri (Ambient Citizens)
   const [citizens] = useState<AmbientCitizen[]>(() => createInitialAmbientCitizens());
@@ -261,6 +427,15 @@ export function ExplorableWorld({
   // 7 Aşamalı Rehberli Görev Sistemi
   const [questStep, setQuestStep] = useState<QuestStepId>(1);
   const currentQuest = QUEST_STEPS[questStep];
+  const [showFirstMissionGuide, setShowFirstMissionGuide] = useState(() => {
+    try {
+      return localStorage.getItem('sehrin_yarini_first_mission_guide_seen') !== 'true';
+    } catch (_) {
+      return true;
+    }
+  });
+  const [questDetailsExpanded, setQuestDetailsExpanded] = useState(false);
+  const [showMinimap, setShowMinimap] = useState(true);
 
   // EKO Akıllı Rehber & Bildirim State'leri
   const [showEkoHint, setShowEkoHint] = useState(false);
@@ -274,7 +449,45 @@ export function ExplorableWorld({
     onAction?: () => void;
   } | null>(null);
 
+  const playerRef = useRef<PlayerMotionState>(player);
+  playerRef.current = player;
+  const activeDialogRef = useRef(activeDialog);
+  activeDialogRef.current = activeDialog;
+  const nearbyInteractionRef = useRef(nearbyInteraction);
+  nearbyInteractionRef.current = nearbyInteraction;
+  const showHeroModalRef = useRef(showHeroModal);
+  showHeroModalRef.current = showHeroModal;
+  const chapterWonRef = useRef(chapterWon);
+  chapterWonRef.current = chapterWon;
+  const chapterOutcomeRef = useRef(chapterOutcome);
+  chapterOutcomeRef.current = chapterOutcome;
+  const endingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const starRevealKeyRef = useRef<string | null>(null);
+  const isPausedRef = useRef(isPaused);
+  isPausedRef.current = isPaused;
+  const lastSafePlayerRef = useRef({ ...INITIAL_PLAYER_POSITION });
+  const stalledFloodSecondsRef = useRef(0);
+  const terrainBlockedFeedbackRef = useRef(0);
+  const hadRoadClosureRef = useRef(hadRoadClosure);
+  hadRoadClosureRef.current = hadRoadClosure;
+
+  useEffect(() => () => {
+    if (endingTimerRef.current) clearTimeout(endingTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    if (!chapterOutcome || endingVisible) return;
+    const key = `${chapterOutcome.success ? 'success' : 'failure'}-${chapterOutcome.stars}`;
+    if (starRevealKeyRef.current === key) return;
+    starRevealKeyRef.current = key;
+    const timers = [0, 1, 2].map((index) => setTimeout(() => {
+      if (index < chapterOutcome.stars) gameAudio.effect('star');
+    }, index * 120));
+    return () => timers.forEach((timer) => clearTimeout(timer));
+  }, [chapterOutcome, endingVisible]);
+
   const [stormActive, setStormActive] = useState(false);
+  const [weather, setWeather] = useState<WeatherState>(() => createWeatherState(false));
   const [spatialState, setSpatialState] = useState<SpatialSimulationState>(() =>
     createInitialSpatialState([])
   );
@@ -287,8 +500,6 @@ export function ExplorableWorld({
   const joystickBaseRef = useRef<{ startX: number; startY: number } | null>(null);
 
   // Dünya Sabitleri
-  const WORLD_WIDTH = 2200;
-  const WORLD_HEIGHT = 1500;
   const SAVE_KEY = 'felaket_benim_quest_save_v2';
 
   // Fiziksel Katı Engeller (Çarpışma Tespiti & Navigasyon Grafı)
@@ -317,6 +528,9 @@ export function ExplorableWorld({
     { x: 1480, y: 190, r: 20 },
   ], []);
 
+  const touchMovementRef = useRef(touchMovement);
+  touchMovementRef.current = touchMovement;
+
   // Sokak Lambaları
   const streetLamps = useMemo(() => [
     { x: 1260, y: 480 },
@@ -324,6 +538,33 @@ export function ExplorableWorld({
     { x: 1060, y: 670 },
     { x: 780, y: 710 },
   ], []);
+
+  const discoverSolution = useCallback((id: DefenseId, source: string) => {
+    const solution = getSolution(id);
+    const wasKnown = discoveredSolutionsRef.current.includes(id);
+    if (!wasKnown) {
+      const next = [...discoveredSolutionsRef.current, id];
+      discoveredSolutionsRef.current = next;
+      setDiscoveredSolutions(next);
+      setQuestToast({
+        kicker: 'İKLİM ÇÖZÜMÜ KEŞFEDİLDİ',
+        text: `${solution.name} · ${getDiscoveryProgress(next)} · ${source}`,
+      });
+      window.setTimeout(() => setQuestToast((current) => (
+        current?.kicker === 'İKLİM ÇÖZÜMÜ KEŞFEDİLDİ' ? null : current
+      )), 3600);
+      gameAudio.effect('transition');
+    }
+  }, []);
+
+  const investigateSolution = useCallback((id: DefenseId, source: string) => {
+    discoverSolution(id, source);
+    if (!investigatedSolutionsRef.current.includes(id)) {
+      const nextInvestigated = [...investigatedSolutionsRef.current, id];
+      investigatedSolutionsRef.current = nextInvestigated;
+      setInvestigatedSolutions(nextInvestigated);
+    }
+  }, [discoverSolution]);
 
   // Görev İlerleme ve Toast Tetikleyicisi
   const triggerQuestAdvance = useCallback((nextStep: QuestStepId, toastText: string) => {
@@ -336,25 +577,40 @@ export function ExplorableWorld({
     return () => clearTimeout(timer);
   }, []);
 
+  const dismissFirstMissionGuide = useCallback(() => {
+    setShowFirstMissionGuide(false);
+    try {
+      localStorage.setItem('sehrin_yarini_first_mission_guide_seen', 'true');
+    } catch (_) {}
+  }, []);
+
   // LocalStorage Kayıt Yükleme
   useEffect(() => {
     try {
       const saved = localStorage.getItem(SAVE_KEY);
       if (saved) {
-        const data = JSON.parse(saved);
+        const data = migrateQuestSave(JSON.parse(saved)) as Record<string, any> | null;
+        if (!data) return;
         if (data.questStep && data.questStep >= 1 && data.questStep <= 7) {
           setQuestStep(data.questStep as QuestStepId);
         }
         if (data.heroType === 'female' || data.heroType === 'male') {
           setHeroType(data.heroType);
         }
-        if (data.player && typeof data.player.x === 'number') {
-          setPlayer((prev) => ({
-            ...prev,
-            x: data.player.x,
-            y: data.player.y,
-            facing: data.player.facing || 'down',
-          }));
+        if (data.compassVisible === false) {
+          setShowCompass(false);
+        }
+        if (data.player && typeof data.player.x === 'number' && typeof data.player.y === 'number') {
+          const savedPosition = { x: data.player.x, y: data.player.y };
+          if (canPlayerOccupy(savedPosition, obstacles, trees, WORLD_WIDTH, WORLD_HEIGHT, 0, WORLD_TERRAIN_MASK)) {
+            setPlayer((prev) => ({
+              ...prev,
+              ...savedPosition,
+              facing: data.player.facing || 'down',
+            }));
+          } else {
+            console.warn('Saved player position was inside a solid area; using a safe spawn point.');
+          }
         }
         if (Array.isArray(data.activeDefenses) && data.activeDefenses.length > 0) {
           setActiveDefenses(data.activeDefenses);
@@ -363,34 +619,101 @@ export function ExplorableWorld({
             stepSpatialSimulation(createInitialSpatialState(data.activeDefenses), data.activeDefenses)
           );
         }
+        if (Array.isArray(data.discoveredSolutions)) {
+          setDiscoveredSolutions(data.discoveredSolutions.filter((id: unknown): id is DefenseId =>
+            DEFENSES.some((defense) => defense.id === id)
+          ));
+        } else if (Array.isArray(data.activeDefenses)) {
+          // Compatible v1–v3 saves keep built solutions visible in the journal.
+          setDiscoveredSolutions(data.activeDefenses.filter((id: unknown): id is DefenseId =>
+            DEFENSES.some((defense) => defense.id === id)
+          ));
+        }
+        if (Array.isArray(data.investigatedSolutions)) {
+          setInvestigatedSolutions(data.investigatedSolutions.filter((id: unknown): id is DefenseId =>
+            DEFENSES.some((defense) => defense.id === id)
+          ));
+        }
+        if (Array.isArray(data.pendingPlan)) {
+          setPendingPlan(data.pendingPlan.filter((id: unknown): id is DefenseId =>
+            DEFENSES.some((defense) => defense.id === id)
+          ));
+        }
+        if (typeof data.planConfirmed === 'boolean') setPlanConfirmed(data.planConfirmed);
+        if (data.spatialState && typeof data.spatialState === 'object' && data.spatialState.cells) {
+          setSpatialState(data.spatialState as SpatialSimulationState);
+        }
         if (data.stormActive) {
           setStormActive(true);
+          setWeather(startStormWeather());
         }
         if (data.chapterWon) {
           setChapterWon(true);
+        }
+        if (data.chapterOutcome) setChapterOutcome(data.chapterOutcome);
+        if (data.gameMode === 'relaxed' || data.gameMode === 'adventure') setGameMode(data.gameMode);
+        if (typeof data.stormElapsedSeconds === 'number') setStormElapsedSeconds(data.stormElapsedSeconds);
+        if (typeof data.rescueCount === 'number') setRescueCount(data.rescueCount);
+        if (typeof data.inspectedLocations === 'number') setInspectedLocations(data.inspectedLocations);
+        if (typeof data.hadRoadClosure === 'boolean') setHadRoadClosure(data.hadRoadClosure);
+        if (data.chapterRecord) setChapterRecord(data.chapterRecord);
+        if (data.achievements) setAchievements(data.achievements);
+        if (Array.isArray(data.discoveredDistricts)) {
+          setDiscoveredDistricts(new Set(data.discoveredDistricts.filter((id: unknown): id is DistrictId =>
+            CITY_DISTRICTS.some((district) => district.id === id)
+          )));
         }
       }
     } catch (e) {
       console.warn('LocalStorage restore failed:', e);
     }
-  }, []);
+  }, [obstacles, trees]);
 
   // LocalStorage Otomatik Kaydetme
   useEffect(() => {
     try {
       const payload = {
+        saveVersion: 4,
         questStep,
         heroType,
         player: { x: player.x, y: player.y, facing: player.facing },
         activeDefenses,
         budgetUsed,
+        discoveredSolutions,
+        investigatedSolutions,
+        pendingPlan,
+        planConfirmed,
+        spatialState,
         stormActive,
+        weatherPhase: weather.phase,
+        gameMode,
+        stormElapsedSeconds,
+        rescueCount,
+        inspectedLocations,
+        hadRoadClosure,
+        chapterRecord,
+        achievements,
+        currentDistrictId,
+        discoveredDistricts: [...discoveredDistricts],
+        chapterOutcome,
         chapterWon,
+        compassVisible: showCompass,
       };
       localStorage.setItem(SAVE_KEY, JSON.stringify(payload));
+      localStorage.setItem('sehrin_yarini_achievements', JSON.stringify(achievements));
+      localStorage.setItem('sehrin_yarini_mode', gameMode);
       localStorage.setItem('felaket_benim_hero', heroType);
+      localStorage.setItem('felaket_benim_compass_visible', String(showCompass));
     } catch (_) {}
-  }, [questStep, heroType, player.x, player.y, player.facing, activeDefenses, budgetUsed, stormActive, chapterWon]);
+  }, [questStep, heroType, player.x, player.y, player.facing, activeDefenses, budgetUsed, discoveredSolutions, investigatedSolutions, pendingPlan, planConfirmed, spatialState, stormActive, weather.phase, gameMode, stormElapsedSeconds, rescueCount, inspectedLocations, hadRoadClosure, chapterRecord, achievements, currentDistrictId, discoveredDistricts, chapterOutcome, chapterWon, showCompass]);
+
+  useEffect(() => {
+    if (discoveredDistricts.size !== CITY_DISTRICTS.length || achievements.city_explorer) return;
+    const record: AchievementRecord = { unlockedAt: new Date().toISOString() };
+    setAchievements((previous) => previous.city_explorer ? previous : { ...previous, city_explorer: record });
+    setAchievementNotice('city_explorer');
+    gameAudio.effect('victory');
+  }, [achievements.city_explorer, discoveredDistricts]);
 
   // Görevi Baştan Başlatma (Reset)
   const handleResetQuest = useCallback(() => {
@@ -399,20 +722,33 @@ export function ExplorableWorld({
     } catch (_) {}
     setQuestStep(1);
     setPlayer({
-      x: 650,
-      y: 560,
+      ...INITIAL_PLAYER_POSITION,
       vx: 0,
       vy: 0,
       facing: 'up',
       isMoving: false,
       frame: 0,
     });
+    setCurrentDistrictId(getCityDistrictAt(INITIAL_PLAYER_POSITION.x, INITIAL_PLAYER_POSITION.y).id);
     setActiveDefenses([]);
     setBudgetUsed(0);
     setStormActive(false);
+    setWeather(createWeatherState(false));
+    setChapterOutcome(null);
+    setIsPaused(false);
+    setStormElapsedSeconds(0);
+    setRescueCount(0);
+    setInspectedLocations(0);
+    setHadRoadClosure(false);
+    stalledFloodSecondsRef.current = 0;
     setChapterWon(false);
     setSpatialState(createInitialSpatialState([]));
     setShowEkoHint(false);
+    if (endingTimerRef.current) clearTimeout(endingTimerRef.current);
+    endingTimerRef.current = null;
+    setEndingVisible(false);
+    setEndingNewBadges([]);
+    setAchievementNotice(null);
     setQuestToast({ kicker: 'GÖREV SIFIRLANDI', text: 'Bölüm 1: İklim Araştırma İstasyonu baştan başlatıldı.' });
     setTimeout(() => setQuestToast(null), 3000);
     gameAudio.effect('click');
@@ -427,15 +763,6 @@ export function ExplorableWorld({
   const distanceMeters = useMemo(() => {
     return calculateDistanceMeters({ x: player.x, y: player.y }, targetPoint);
   }, [player.x, player.y, targetPoint]);
-
-  // Kamera Koordinatları
-  const camX = Math.max(0, Math.min(WORLD_WIDTH - canvasSize.width, player.x - canvasSize.width / 2));
-  const camY = Math.max(0, Math.min(WORLD_HEIGHT - canvasSize.height, player.y - canvasSize.height / 2));
-
-  // Ekran Dışı Yön Ok Göstergesi
-  const offScreenIndicator = useMemo<OffScreenIndicator>(() => {
-    return getOffScreenIndicator(targetPoint, { camX, camY }, canvasSize, 56);
-  }, [targetPoint, camX, camY, canvasSize]);
 
   // EKO Kural Tabanlı İpucu Motoru
   const ekoHint = useMemo(() => {
@@ -512,6 +839,36 @@ export function ExplorableWorld({
       defenseId: 'sünger',
     },
     {
+      id: 'warning_station',
+      x: 900,
+      y: 340,
+      radius: 58,
+      label: 'ERKEN UYARI AĞI',
+      actionText: activeDefenses.includes('uyarı') ? 'Erken Uyarı Ağını Kaldır' : 'Erken Uyarı Ağı Kur (18 Kredi)',
+      type: 'warning_site',
+      defenseId: 'uyarı',
+    },
+    {
+      id: 'retrofit_construction',
+      x: 1340,
+      y: 530,
+      radius: 62,
+      label: 'GÜVENLİ DÖNÜŞÜM SAHASI',
+      actionText: activeDefenses.includes('dönüşüm') ? 'Güvenli Dönüşümü Kaldır' : 'Güvenli Dönüşüm Kur (36 Kredi)',
+      type: 'retrofit_site',
+      defenseId: 'dönüşüm',
+    },
+    {
+      id: 'seawall_construction',
+      x: 1800,
+      y: 620,
+      radius: 62,
+      label: 'KIYI SETİ HATTI',
+      actionText: activeDefenses.includes('set') ? 'Kıyı Setini Kaldır' : 'Kıyı Seti Kur (42 Kredi)',
+      type: 'seawall_site',
+      defenseId: 'set',
+    },
+    {
       id: 'road_inspection',
       x: 1240,
       y: 500,
@@ -540,10 +897,142 @@ export function ExplorableWorld({
     },
   ], [activeDefenses, questStep]);
 
+  const interactionPointsRef = useRef(interactionPoints);
+  interactionPointsRef.current = interactionPoints;
+  const targetPointRef = useRef(targetPoint);
+  targetPointRef.current = targetPoint;
+  const spatialStateRef = useRef(spatialState);
+  spatialStateRef.current = spatialState;
+  const activeDefensesRef = useRef(activeDefenses);
+  activeDefensesRef.current = activeDefenses;
+  const discoveredSolutionsRef = useRef(discoveredSolutions);
+  discoveredSolutionsRef.current = discoveredSolutions;
+  const investigatedSolutionsRef = useRef(investigatedSolutions);
+  investigatedSolutionsRef.current = investigatedSolutions;
+  const stormActiveRef = useRef(stormActive);
+  stormActiveRef.current = stormActive;
+  const weatherRef = useRef(weather);
+  weatherRef.current = weather;
+  const gameModeRef = useRef(gameMode);
+  gameModeRef.current = gameMode;
+  const questStepRef = useRef(questStep);
+  questStepRef.current = questStep;
+  const currentQuestRef = useRef(currentQuest);
+  currentQuestRef.current = currentQuest;
+  const heroTypeRef = useRef(heroType);
+  heroTypeRef.current = heroType;
+  const currentDistrictRef = useRef(currentDistrictId);
+  currentDistrictRef.current = currentDistrictId;
+
+  const openPlanningJournal = useCallback(() => {
+    setPendingPlan(activeDefensesRef.current);
+    setPlanningOpen(true);
+    setActiveDialog(null);
+  }, []);
+
+  const compassBearing = useMemo(
+    () => calculateCompassBearing({ x: player.x, y: player.y }, targetPoint),
+    [player.x, player.y, targetPoint],
+  );
+  const targetReached = Math.hypot(player.x - targetPoint.x, player.y - targetPoint.y) <= 65;
+  const currentDistrict = CITY_DISTRICTS.find((district) => district.id === currentDistrictId) ?? CITY_DISTRICTS[1];
+  const routeReachable = useMemo(() => {
+    const route = findNavRoute(
+      { x: player.x, y: player.y },
+      targetPoint,
+      obstacles,
+      spatialState.hospitalRoadWaterDepth,
+    );
+    return isNavRouteTraversable(route, obstacles, spatialState.hospitalRoadWaterDepth);
+  }, [player.x, player.y, targetPoint, obstacles, spatialState.hospitalRoadWaterDepth]);
+  const navigationWarning =
+    !targetReached && !routeReachable
+      ? spatialState.hospitalRoadWaterDepth > 30
+        ? 'Bu yol su altında. Güvenli bir geçiş aramalısın.'
+        : 'EKO: Hedefe doğrudan geçiş kapalı.'
+      : null;
+
+  const beginEnding = useCallback((outcome: ChapterOutcome) => {
+    if (endingTimerRef.current) clearTimeout(endingTimerRef.current);
+    starRevealKeyRef.current = null;
+    setChapterOutcome(outcome);
+    setChapterWon(outcome.success);
+    setEndingVisible(true);
+    gameAudio.effect(outcome.success ? 'ending-victory' : 'ending-failure');
+    endingTimerRef.current = setTimeout(() => {
+      setEndingVisible(false);
+      endingTimerRef.current = null;
+    }, 1900);
+  }, []);
+
+  const skipEnding = useCallback(() => {
+    if (endingTimerRef.current) clearTimeout(endingTimerRef.current);
+    endingTimerRef.current = null;
+    setEndingVisible(false);
+  }, []);
+
+  const completeChapter = useCallback(() => {
+    if (chapterOutcomeRef.current) return;
+    const citizensSafe = spatialStateRef.current.hospitalRoadPassable
+      && (activeDefenses.includes('sünger') || activeDefenses.includes('dönüşüm'));
+    const outcomeInput = {
+      missionComplete: true,
+      hospitalRoadPassable: spatialStateRef.current.hospitalRoadPassable,
+      citizensSafe,
+      rescueCount,
+      temporaryRoadClosure: hadRoadClosureRef.current,
+      elapsedSeconds: stormElapsedSeconds,
+      budgetRemaining: BUDGET - budgetUsed,
+      mode: gameMode,
+    } as const;
+    const outcome = evaluateChapterOutcome(outcomeInput);
+    beginEnding(outcome);
+    setChapterRecord((previous) => mergeChapterRecord(previous ?? undefined, outcome, outcomeInput));
+
+    const unlocks = getAchievementUnlocks({
+      firstInteraction: questStep >= 2,
+      inspectedLocations,
+      adaptationBuilt: activeDefenses.includes('sünger') || activeDefenses.includes('dönüşüm'),
+      floodReduced: spatialStateRef.current.hospitalRoadWaterDepth < 30,
+      hospitalHero: outcome.success,
+      citizensSafe,
+      stars: outcome.stars,
+    });
+    setAchievements((previous) => {
+      const next = { ...previous };
+      const newlyUnlocked = unlocks.filter((id) => !next[id]);
+      if (newlyUnlocked.length > 0) {
+        const unlockedAt = new Date().toISOString();
+        newlyUnlocked.forEach((id) => { next[id] = { unlockedAt }; });
+        setEndingNewBadges(newlyUnlocked);
+        setAchievementNotice(newlyUnlocked[0]);
+        gameAudio.effect('achievement');
+      }
+      return next;
+    });
+    gameAudio.effect(outcome.success ? 'victory' : 'error');
+  }, [activeDefenses, beginEnding, budgetUsed, gameMode, inspectedLocations, questStep, rescueCount, stormElapsedSeconds]);
+
+  const failChapter = useCallback((reason = 'Bu kez yetişemedik. Ama yeniden deneyebilirsin!') => {
+    if (chapterOutcomeRef.current) return;
+    const input = {
+      missionComplete: false,
+      hospitalRoadPassable: spatialStateRef.current.hospitalRoadPassable,
+      citizensSafe: false,
+      rescueCount,
+      temporaryRoadClosure: true,
+      elapsedSeconds: stormElapsedSeconds,
+      budgetRemaining: BUDGET - budgetUsed,
+      mode: gameMode,
+    } as const;
+    beginEnding({ ...evaluateChapterOutcome(input), reason });
+  }, [beginEnding, budgetUsed, gameMode, rescueCount, stormElapsedSeconds]);
+
   // Savunma İnşa Etme / Kaldırma İşlevi
   const toggleWorldDefense = useCallback((id: DefenseId) => {
     const defense = DEFENSES.find((d) => d.id === id)!;
     if (!activeDefenses.includes(id)) {
+      investigateSolution(id, 'Saha noktası incelendi');
       if (budgetUsed + defense.cost > BUDGET) {
         gameAudio.effect('error');
         setActiveDialog({
@@ -555,16 +1044,52 @@ export function ExplorableWorld({
       }
       gameAudio.effect('investment');
       const nextDefenses = [...activeDefenses, id];
+      const beforeDepth = spatialStateRef.current.hospitalRoadWaterDepth;
+      const nextSpatialState = stepSpatialSimulation(spatialStateRef.current, nextDefenses);
+      // Fırtına başlamadan kurulan savunma, oyuncu etkileşiminden sonra hazır
+      // kabul edilir. Böylece hazırlık yatırımı gerçekten fırtına öncesi
+      // tamamlanabilir; fırtına sırasında kurulan savunma ise simülasyondaki
+      // üç adımlık devreye alma gecikmesini korur.
+      const installedState = id === 'sünger' && !stormActive
+        ? { ...nextSpatialState, spongeOperational: true, spongeDeploymentTicksRemaining: 0 }
+        : nextSpatialState;
       setActiveDefenses(nextDefenses);
       setBudgetUsed((prev) => prev + defense.cost);
-      setSpatialState((prev) => stepSpatialSimulation(prev, nextDefenses));
+      setSpatialState(installedState);
+      setPendingPlan(nextDefenses);
+      setPlanConfirmed(true);
+
+      if (id === 'sünger') {
+        setQuestToast({
+          kicker: 'SÜNGER KENT DEVREDE',
+          text: `${stormActive ? 'Tutma alanı kuruluyor.' : 'Tutma alanı fırtına öncesi hazırlandı.'} ${DEFENSE_GUIDANCE[id].effect} İlk kapasite: ${installedState.spongeStorage.toFixed(1)} / ${installedState.spongeStorageCapacity} cm.`,
+        });
+        setTimeout(() => {
+          const current = spatialStateRef.current;
+          const delta = current.hospitalRoadWaterDepth - beforeDepth;
+          const feedback = delta < -0.2
+            ? `Harika! Su derinliği ${Math.abs(delta).toFixed(1)} cm azaldı; yüzey akışı tutma alanına yönleniyor.`
+            : current.spongeStorage >= current.spongeStorageCapacity - 0.1
+              ? 'Su tutma alanı dolu; yağış kapasiteyi aşıyor. Hastane yolu hâlâ risk altında.'
+              : `Sünger Kent çalışıyor; yol suyu ${current.hospitalRoadWaterDepth.toFixed(1)} cm. Toparlanma sürüyor.`;
+          setQuestToast({ kicker: 'EKO / GERÇEK ZAMANLI ÖLÇÜM', text: feedback });
+          setTimeout(() => setQuestToast(null), 4200);
+        }, 1100);
+      } else {
+        const roadDelta = beforeDepth - installedState.hospitalRoadWaterDepth;
+        setQuestToast({
+          kicker: `${defense.name.toUpperCase()} KURULDU`,
+          text: `${DEFENSE_GUIDANCE[id].effect} Hastane yolu ölçümü: ${beforeDepth.toFixed(1)} → ${installedState.hospitalRoadWaterDepth.toFixed(1)} cm (${roadDelta >= 0 ? '−' : '+'}${Math.abs(roadDelta).toFixed(1)} cm). Sınır: ${DEFENSE_GUIDANCE[id].limit}`,
+        });
+        setTimeout(() => setQuestToast(null), 4600);
+      }
 
       if (questStep === 5) {
         triggerQuestAdvance(6, `${defense.name} inşa edildi! Hastane yolundaki suyun çekilmesini doğrula.`);
         setActiveDialog({
           speaker: 'ARAS',
-          title: 'SÜNGER KENT GÖLETİ TAMAMLANDI!',
-          text: `${defense.name} başarıyla inşa edildi! Yamaç yüzey akışı gölete yönlendirildi ve taşkın debisi kesildi. Altın izi takip ederek aşağıdaki hastane yoluna in ve ambulans koridorunun açıldığını doğrula!`,
+          title: `${defense.name.toUpperCase()} TAMAMLANDI!`,
+          text: `${defense.name} devrede. Etkisini aynı fırtına koşullarında gözlemle; yol sensörü gerçek su değişimini gösterecek.`,
           actionLabel: 'Yolu Denetle',
           onAction: () => setActiveDialog(null),
         });
@@ -574,14 +1099,92 @@ export function ExplorableWorld({
       const nextDefenses = activeDefenses.filter((x) => x !== id);
       setActiveDefenses(nextDefenses);
       setBudgetUsed((prev) => prev - defense.cost);
-      setSpatialState((prev) => stepSpatialSimulation(prev, nextDefenses));
+      setSpatialState(stepSpatialSimulation(spatialStateRef.current, nextDefenses));
+      setQuestToast({
+        kicker: `${defense.name.toUpperCase()} KALDIRILDI`,
+        text: `${defense.name} artık simülasyona katkı vermiyor; ${defense.cost} kredi bütçeye geri döndü.`,
+      });
+      setTimeout(() => setQuestToast(null), 3200);
     }
-  }, [activeDefenses, budgetUsed, questStep, triggerQuestAdvance]);
+  }, [activeDefenses, budgetUsed, investigateSolution, questStep, stormActive, triggerQuestAdvance]);
+
+  const plannedBudgetUsed = useMemo(
+    () => pendingPlan.reduce((total, id) => total + (DEFENSES.find((defense) => defense.id === id)?.cost ?? 0), 0),
+    [pendingPlan],
+  );
+
+  const togglePlannedSolution = useCallback((id: DefenseId) => {
+    const state = getSolutionState(id, discoveredSolutionsRef.current, investigatedSolutionsRef.current, activeDefensesRef.current);
+    if (state === 'LOCKED' || state === 'DISCOVERED') {
+      investigateSolution(id, 'Şehir Planı incelemesi');
+      setPendingPlan((previous) => previous.includes(id)
+        ? previous.filter((item) => item !== id)
+        : [...previous, id]);
+      const solution = getSolution(id);
+      setQuestToast({ kicker: 'ÇÖZÜM PLANA EKLENDİ', text: `${solution.name} araştırıldı ve geçici plana eklendi. İstersen onaydan önce çıkarabilirsin.` });
+      window.setTimeout(() => setQuestToast((current) => (
+        current?.kicker === 'ÇÖZÜM PLANA EKLENDİ' ? null : current
+      )), 3600);
+      return;
+    }
+    setPendingPlan((previous) => previous.includes(id)
+      ? previous.filter((item) => item !== id)
+      : [...previous, id]);
+  }, [investigateSolution]);
+
+  const confirmPlanningJournal = useCallback(() => {
+    if (plannedBudgetUsed > BUDGET) {
+      setQuestToast({ kicker: 'BÜTÇE AŞILDI', text: `Bu plan ${plannedBudgetUsed} Kr tutuyor; mevcut bütçe ${BUDGET} Kr. Bir çözümü çıkarıp yeniden dene.` });
+      return;
+    }
+    const nextState = stepSpatialSimulation(spatialStateRef.current, pendingPlan);
+    setActiveDefenses(pendingPlan);
+    setBudgetUsed(plannedBudgetUsed);
+    setSpatialState(nextState);
+    setPlanConfirmed(true);
+    setPlanningOpen(false);
+    setQuestToast({
+      kicker: 'PLAN ONAYLANDI',
+      text: pendingPlan.length
+        ? `${pendingPlan.map((id) => getSolution(id).name).join(' + ')} seçildi. Şimdi simülasyonda gerçek su değişimini izle.`
+        : 'Bu tur savunma kurmadan ilerlemeyi seçtin; sonuçlar gerçek simülasyondan gelecek.',
+    });
+    if (questStep === 5) {
+      triggerQuestAdvance(6, pendingPlan.length ? 'Plan kuruldu! Hastane yolundaki gerçek su değişimini doğrula.' : 'Savunmasız plan onaylandı. Fırtınanın gerçek sonucunu gözlemle.');
+    }
+  }, [pendingPlan, plannedBudgetUsed, questStep, triggerQuestAdvance]);
+
+  // E basıldığı anda bir frame önceki React state'ine güvenme; oyuncunun
+  // güncel konumundan etkileşimi yeniden çözerek hızlı girişlerde yanlış
+  // objenin tetiklenmesini engelle.
+  const resolveCurrentInteraction = useCallback(() => {
+    const playerPosition = playerRef.current;
+    const target = targetPointRef.current;
+    const points = interactionPointsRef.current;
+    const questTarget = points.find((point) => (
+      Math.hypot(point.x - target.x, point.y - target.y) < 1
+      && Math.hypot(playerPosition.x - point.x, playerPosition.y - point.y) < point.radius
+    ));
+    if (questTarget) return questTarget;
+
+    let closest: InteractionPoint | null = null;
+    let minDistance = Infinity;
+    for (const point of points) {
+      const distance = Math.hypot(playerPosition.x - point.x, playerPosition.y - point.y);
+      if (distance < point.radius && distance < minDistance) {
+        closest = point;
+        minDistance = distance;
+      }
+    }
+    return closest;
+  }, []);
 
   // Etkileşim Butonuna / E Tuşuna Basıldığında
   const handleInteract = useCallback(() => {
     gameAudio.unlock();
-    if (!nearbyInteraction) {
+    if (showFirstMissionGuide) dismissFirstMissionGuide();
+    const currentInteraction = resolveCurrentInteraction();
+    if (!currentInteraction) {
       if (nearbyCitizen) {
         gameAudio.effect('click');
         nearbyCitizen.speechBubble = {
@@ -596,43 +1199,39 @@ export function ExplorableWorld({
     }
     gameAudio.effect('click');
 
-    switch (nearbyInteraction.type) {
+    switch (currentInteraction.type) {
       case 'npc_mira':
         if (questStep === 1) {
+          investigateSolution('uyarı', 'Mira’nın risk değerlendirmesi');
           triggerQuestAdvance(2, 'Saha görevi alındı! Hastane yolundaki menfezi incele.');
           setActiveDialog({
             speaker: 'MİRA',
             title: 'KRİTİK İKLİM UYARISI',
-            text: `Hoş geldin ${HEROES[heroType].name}! Meteoroloji radarı 88 mm/saatlik süper hücre fırtınasının yamaç havzasına indiğini gösteriyor. Şehir Hastanesi Acil Servis yolu en savunmasız noktamız. Altın rota izini takip ederek hastane yolundaki drenaj menfezini acilen incele ve kapasite durumunu bildir!`,
+            text: `Hoş geldin ${HEROES[heroType].name}! Meteoroloji radarı 88 mm/saatlik süper hücre fırtınasının yamaç havzasına indiğini gösteriyor. Şehir Hastanesi Acil Servis yolu en savunmasız noktamız. Pusuladaki hedef yönünü takip ederek hastane yolundaki drenaj menfezini acilen incele ve kapasite durumunu bildir!`,
             actionLabel: 'Menfezi İncelemeye Git',
             onAction: () => setActiveDialog(null),
           });
         } else if (questStep === 7) {
           gameAudio.effect('victory');
-          setChapterWon(true);
-          setActiveDialog({
-            speaker: 'MİRA',
-            title: '🏆 BÖLÜM 1 ZAFERİ: HASTANE YOLU KURTARILDI!',
-            text: `Olağanüstü bir başarı ${HEROES[heroType].name}! Sünger Kent göleti yamaç yüzey akışını %60 oranında tuttu. Yol üzerindeki su seviyesi 14.2 cm'ye düştü ve ambulans koridoru kesintisiz açık kaldı. Şehri ve hastanedeki insanları kurtardın!`,
-            actionLabel: 'Zafer Raporunu İncele',
-            onAction: () => setActiveDialog(null),
-          });
+          completeChapter();
         } else {
           setActiveDialog({
             speaker: 'MİRA',
             title: 'İKLİM ARAŞTIRMA İSTASYONU',
-            text: `Fırtına havzada ilerliyor ${HEROES[heroType].name}. Aktif hedefin: ${currentQuest.title}. Altın rota izini takip etmeye devam et!`,
+            text: `Fırtına havzada ilerliyor ${HEROES[heroType].name}. Aktif hedefin: ${currentQuest.title}. Pusuladaki hedef yönünü takip etmeye devam et!`,
           });
         }
         break;
 
       case 'drainage':
         if (questStep === 2) {
+          investigateSolution('dönüşüm', 'Hastane yolu menfez incelemesi');
+          setInspectedLocations((value) => Math.max(value, 1));
           triggerQuestAdvance(3, 'Menfez yetersizliği tespit edildi! Mühendis Aras ile görüş.');
           setActiveDialog({
             speaker: 'EKO',
             title: 'DRENAJ KAPASİTE RAPORU',
-            text: 'Menfez ızgarası yaprak ve çamurla kısmen tıkanmış durumda! Mevcut tahliye kapasitesi yalnızca 18 mm/tick, oysa yamaçtan beklenen akış 45 mm/tick! Şantiye yol ayrımındaki Saha Mühendisi Aras ile derhal görüşmelisin!',
+            text: 'Menfez ızgarası yaprak ve çamurla kısmen tıkanmış durumda! Mevcut tahliye kapasitesi yalnızca 18 mm/tick, oysa yamaçtan beklenen akış 45 mm/tick. Bu, menfez iyileştirmesinin kritik koridor için neden önemli olduğunu gösteriyor. Şantiye yol ayrımındaki Aras ile seçenekleri karşılaştır.',
             actionLabel: 'Aras ile Konuş',
             onAction: () => setActiveDialog(null),
           });
@@ -649,11 +1248,12 @@ export function ExplorableWorld({
 
       case 'npc_aras':
         if (questStep === 3) {
+          investigateSolution('dönüşüm', 'Aras’ın mühendislik planı');
           triggerQuestAdvance(4, 'Mühendislik planı hazır! Fırtınanın gelişini gözlemle.');
           setActiveDialog({
             speaker: 'ARAS',
             title: 'MÜHENDİSLİK RİSK PLANI',
-            text: `Raporu inceledim ${HEROES[heroType].name}. Bu menfez tek başına çöker! Fırtına başladığı anda aşağıdaki yol çukuru 30 cm suyla dolup ambulansları durduracak. Hemen aşağıdaki taşkın gözlem noktasına geç ve suyun yükselişini gözlemle!`,
+            text: `Raporu inceledim ${HEROES[heroType].name}. Üç farklı altyapı yaklaşımı var: menfezi güçlendirmek, yüzey akışını tutmak veya kıyı suyunu sınırlamak. Erken uyarı da insanlara zaman kazandırır. Önce aynı fırtınada kırılma noktasını gözlemle, sonra Şehir Planı’nda karşılaştır.`,
             actionLabel: 'Gözlem Noktasına Git',
             onAction: () => setActiveDialog(null),
           });
@@ -661,7 +1261,7 @@ export function ExplorableWorld({
           setActiveDialog({
             speaker: 'ARAS',
             title: 'MÜDAHALE ÖNERİSİ',
-            text: 'Yol çukurundaki su 30 cm kritik seviyeyi aştı! Yukarı terastaki Sünger Kent sahasına çıkıp su tutma göletini inşa etmelisin!',
+            text: `Yol çukurundaki su ${spatialState.hospitalRoadWaterDepth} cm. Şehir Planı’nda araştırdığın seçenekleri karşılaştır; bütçene ve korumak istediğin bölgeye göre karar senin.`,
           });
         } else {
           setActiveDialog({
@@ -675,14 +1275,25 @@ export function ExplorableWorld({
       case 'flood_observation':
         if (questStep === 4) {
           setStormActive(true);
+          const firstStormState = stepSpatialSimulation(spatialState, activeDefenses);
+          setSpatialState(firstStormState);
           gameAudio.effect('thunder');
-          triggerQuestAdvance(5, '88 mm/saat fırtına başladı! Sünger Kent sahasına çık.');
+          const preparedHydraulicDefense = activeDefenses.includes('sünger') || activeDefenses.includes('dönüşüm');
+          const preparedScenario = preparedHydraulicDefense && firstStormState.hospitalRoadPassable;
+          triggerQuestAdvance(
+            preparedScenario ? 6 : 5,
+            preparedScenario
+              ? 'Hazırlık planı devrede! Fırtına başladı; hastane yolundaki suyun davranışını ve erişimi doğrula.'
+              : '88 mm/saat fırtına başladı! Şehir Planı’nı aç, çözümlerin gerçek etkisini aynı fırtına üzerinde karşılaştır.'
+          );
           setActiveDialog({
             speaker: 'EKO',
             title: '🚨 ALARM: FIRTINA PATLADI!',
-            text: '88 mm/saat süper hücre fırtınası başladı! Yamaç akışı yol çukurunda toplandı, su derinliği 38.5 cm’ye ulaştı ve ambulans geçişi kesildi! Doğrudan yoldan geçiş imkansız. Kuzey terastaki güvenli patikadan Sünger Kent sahasına çık ve su tutma göletini inşa et!',
-            actionLabel: 'Sünger Kent Sahasına Çık',
-            onAction: () => setActiveDialog(null),
+            text: preparedScenario
+              ? `88 mm/saat süper hücre fırtınası başladı! İlk saha ölçümü ${firstStormState.hospitalRoadWaterDepth} cm. Hazırlık yatırımların aktif; hastane yoluna giderek erişimin korunduğunu doğrula.`
+              : `88 mm/saat süper hücre fırtınası başladı! İlk saha ölçümü ${firstStormState.hospitalRoadWaterDepth} cm. Yol seviyesi yükselirken kararını Şehir Planı’nda oluştur ve sonra gerçek su değişimini izle.`,
+            actionLabel: preparedScenario ? 'Hastane Yolunu Denetle' : 'Şehir Planını Aç',
+            onAction: preparedScenario ? () => setActiveDialog(null) : openPlanningJournal,
           });
         } else {
           setActiveDialog({
@@ -695,20 +1306,23 @@ export function ExplorableWorld({
 
       case 'sponge_site':
       case 'retrofit_site':
-        if (nearbyInteraction.defenseId) {
-          toggleWorldDefense(nearbyInteraction.defenseId);
+      case 'warning_site':
+      case 'seawall_site':
+        if (currentInteraction.defenseId) {
+          toggleWorldDefense(currentInteraction.defenseId);
         }
         break;
 
       case 'road_inspection':
         if (questStep === 6) {
-          if (spatialState.hospitalRoadPassable && spatialState.hospitalRoadWaterDepth < 20) {
+          if (spatialState.hospitalRoadPassable && spatialState.hospitalRoadWaterDepth <= spatialState.hospitalRoadThreshold) {
+            setInspectedLocations((value) => Math.max(value, 2));
             triggerQuestAdvance(7, 'Ambulans koridoru açıldı! Mira\'ya zafer raporu ver.');
             gameAudio.effect('victory');
             setActiveDialog({
               speaker: 'EKO',
               title: '✓ YOL DURUMU: GEÇİLEBİLİR!',
-              text: 'Sünger Kent Göleti yamaç akışını doğaya emdirerek yol su derinliğini 14.2 cm’ye indirdi! Ambulans sireni duyuluyor, acil servis koridoru tamamen açık! Zafer raporunu bildirmek için İklim Araştırma İstasyonu’ndaki Mira’ya dön!',
+              text: `${activeDefenses.length ? activeDefenses.map((id) => getSolution(id).name).join(' + ') : 'Kurulmuş bir savunma'} sayesinde su ${spatialState.hospitalRoadWaterDepth} cm seviyesine indi. Ambulans koridoru açık; gözlenen sonucu Mira’ya raporla.`,
               actionLabel: 'Mira\'ya Dön',
               onAction: () => setActiveDialog(null),
             });
@@ -716,7 +1330,7 @@ export function ExplorableWorld({
             setActiveDialog({
               speaker: 'EKO',
               title: 'YOL HALA TAŞKIN ALTINDA',
-              text: `Su derinliği ${spatialState.hospitalRoadWaterDepth} cm (güvenli eşik: <20 cm). Yukarı terastaki Sünger Kent göletini inşa etmeden yol açılamaz!`,
+              text: `Su derinliği ${spatialState.hospitalRoadWaterDepth} cm (güvenli eşik: <=${spatialState.hospitalRoadThreshold} cm). Etkin bir su yönetimi savunması olmadan yol açılamaz!`,
             });
           }
         } else {
@@ -751,7 +1365,6 @@ export function ExplorableWorld({
         break;
     }
   }, [
-    nearbyInteraction,
     nearbyCitizen,
     questStep,
     heroType,
@@ -762,46 +1375,217 @@ export function ExplorableWorld({
     currentQuest,
     toggleWorldDefense,
     triggerQuestAdvance,
+    completeChapter,
+    dismissFirstMissionGuide,
+    investigateSolution,
+    openPlanningJournal,
+    resolveCurrentInteraction,
+    showFirstMissionGuide,
   ]);
+
+  const cancelInteractionHold = useCallback((showFeedback = true) => {
+    const active = interactionHoldRef.current;
+    if (active) window.clearInterval(active.timer);
+    interactionHoldRef.current = null;
+    setInteractionHold(null);
+    if (showFeedback && active) {
+      setQuestToast({ kicker: 'ETKİLEŞİM İPTAL', text: 'İşlem tamamlanmadan bırakıldı. Devam etmek için E tuşunu basılı tut.' });
+      window.setTimeout(() => setQuestToast(null), 2200);
+      gameAudio.effect('click');
+    }
+  }, []);
+
+  const completeInteractionHold = useCallback(() => {
+    const active = interactionHoldRef.current;
+    const currentInteraction = resolveCurrentInteraction();
+    if (!active || !currentInteraction || active.pointId !== currentInteraction.id) {
+      cancelInteractionHold(false);
+      return;
+    }
+    window.clearInterval(active.timer);
+    interactionHoldRef.current = null;
+    setInteractionHold(null);
+    handleInteractRef.current();
+  }, [cancelInteractionHold, resolveCurrentInteraction]);
+
+  const startInteractionHold = useCallback(() => {
+    const point = resolveCurrentInteraction();
+    if (!point || !requiresHoldToInteract(point)) {
+      handleInteractRef.current();
+      return;
+    }
+    if (interactionHoldRef.current?.pointId === point.id) return;
+    cancelInteractionHold(false);
+    const startedAt = performance.now();
+    const active = { pointId: point.id, startedAt, timer: 0 };
+    active.timer = window.setInterval(() => {
+      const currentPoint = resolveCurrentInteraction();
+      if (!currentPoint || currentPoint.id !== active.pointId) {
+        cancelInteractionHold(false);
+        return;
+      }
+      const progress = Math.min(1, (performance.now() - active.startedAt) / HOLD_INTERACTION_DURATION_MS);
+      setInteractionHold({ pointId: active.pointId, progress });
+      if (progress >= 1) completeInteractionHold();
+    }, 40);
+    interactionHoldRef.current = active;
+    setInteractionHold({ pointId: point.id, progress: 0 });
+    gameAudio.effect('click');
+  }, [cancelInteractionHold, completeInteractionHold, resolveCurrentInteraction]);
+
+  const finishInteractionHold = useCallback(() => {
+    const active = interactionHoldRef.current;
+    if (!active) return;
+    if ((performance.now() - active.startedAt) >= HOLD_INTERACTION_DURATION_MS) {
+      completeInteractionHold();
+    } else {
+      cancelInteractionHold(true);
+    }
+  }, [cancelInteractionHold, completeInteractionHold]);
+
+  useEffect(() => () => cancelInteractionHold(false), [cancelInteractionHold]);
 
   // Klavye Kontrolleri
   const keysDown = useRef<Record<string, boolean>>({});
+  const handleInteractRef = useRef(handleInteract);
+  handleInteractRef.current = handleInteract;
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      keysDown.current[e.key.toLowerCase()] = true;
-      if (e.key === 'e' || e.key === 'E') {
-        handleInteract();
+      if (isEditableTarget(e.target)) return;
+
+      const key = e.key.toLowerCase();
+      const isMovementKey = ['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key);
+      if (isMovementKey) {
+        e.preventDefault();
+        keysDown.current[key] = true;
       }
-      if (e.key === 'Escape') {
+
+      if (key === 'e' && !e.repeat && !activeDialogRef.current) {
+        e.preventDefault();
+        if (requiresHoldToInteract(nearbyInteractionRef.current)) startInteractionHold();
+        else handleInteractRef.current();
+      }
+
+      if (key === 'escape') {
+        keysDown.current = {};
         setActiveDialog(null);
         setShowEkoHint(false);
       }
-      if (e.key === 'h' || e.key === 'H') {
+
+      if (key === 'h' && !e.repeat) {
         setShowEkoHint((prev) => !prev);
+      }
+
+      if (key === 'p' && !e.repeat && !activeDialogRef.current) {
+        e.preventDefault();
+        setPendingPlan(activeDefensesRef.current);
+        setPlanningOpen((open) => !open);
+        gameAudio.effect('click');
       }
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
-      keysDown.current[e.key.toLowerCase()] = false;
+      if (isEditableTarget(e.target)) return;
+      const key = e.key.toLowerCase();
+      keysDown.current[key] = false;
+      if (key === 'e') {
+        e.preventDefault();
+        finishInteractionHold();
+      }
+    };
+
+    const clearKeys = () => {
+      keysDown.current = {};
+      cancelInteractionHold(false);
     };
 
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keyup', onKeyUp);
+    window.addEventListener('blur', clearKeys);
+    document.addEventListener('visibilitychange', clearKeys);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
+      window.removeEventListener('blur', clearKeys);
+      document.removeEventListener('visibilitychange', clearKeys);
     };
-  }, [handleInteract]);
+  }, [cancelInteractionHold, finishInteractionHold, startInteractionHold]);
 
-  // Fırtına Aktifken Simülasyon Adımları
+  // Hava durumu fazı, ses ve taşkın motoru aynı sabit zaman tabanından beslenir.
   useEffect(() => {
-    if (!stormActive) return;
+    if (!stormActive) {
+      setWeather(createWeatherState(false));
+      gameAudio.setWeatherPhase('CLEAR');
+      return;
+    }
+
+    setWeather((previous) => startStormWeather(previous));
+    gameAudio.setWeatherPhase('LIGHT_RAIN');
+    let last = performance.now();
+    let accumulator = 0;
     const interval = setInterval(() => {
-      setSpatialState((prev) => stepSpatialSimulation(prev, activeDefenses));
-    }, 150);
-    return () => clearInterval(interval);
-  }, [stormActive, activeDefenses]);
+      const now = performance.now();
+      const elapsed = Math.min(0.5, Math.max(0, (now - last) / 1000));
+      accumulator += elapsed;
+      last = now;
+
+      let steps = 0;
+      if (!isPausedRef.current && !activeDialogRef.current && !chapterOutcomeRef.current) {
+        while (accumulator >= FIXED_SIMULATION_STEP_SECONDS && steps < 4) {
+          setSpatialState((prev) => stepSpatialSimulation(prev, activeDefensesRef.current));
+          accumulator -= FIXED_SIMULATION_STEP_SECONDS;
+          steps += 1;
+        }
+      } else {
+        accumulator = 0;
+      }
+
+      if (gameModeRef.current === 'adventure' && !isPausedRef.current && !activeDialogRef.current && !chapterOutcomeRef.current) {
+        setStormElapsedSeconds((previous) => Math.min(240, previous + elapsed));
+      }
+
+      if (!isPausedRef.current && !activeDialogRef.current && !chapterOutcomeRef.current) {
+        setWeather((previous) => advanceWeather(
+          previous,
+          elapsed,
+          true,
+          spatialStateRef.current.hospitalRoadPassable,
+          activeDefensesRef.current.length > 0,
+        ));
+      }
+    }, 50);
+    return () => {
+      clearInterval(interval);
+      gameAudio.setWeatherPhase('CLEAR');
+    };
+  }, [stormActive]);
+
+  useEffect(() => {
+    if (stormActive && gameMode === 'adventure' && stormElapsedSeconds >= 240 && !chapterOutcome) {
+      failChapter();
+    }
+  }, [chapterOutcome, failChapter, gameMode, stormActive, stormElapsedSeconds]);
+
+  useEffect(() => {
+    if (!stormActive) setWeather(questStep === 4 ? createWeatherPhaseState('OVERCAST') : createWeatherState(false));
+  }, [questStep, stormActive]);
+
+  useEffect(() => {
+    if (stormActive && spatialState.isCompleted) {
+      const hydraulicDefenseBuilt = activeDefenses.includes('sünger') || activeDefenses.includes('dönüşüm');
+      if (!chapterOutcome && questStep >= 5 && spatialState.metrics.peakHospitalRoadWaterDepth > spatialState.hospitalRoadThreshold && !hydraulicDefenseBuilt) {
+        failChapter('Fırtına döngüsü tamamlandı; hastane yolu kritik taşkın gördü ve etkili bir su yönetimi savunması kurulmadı.');
+      }
+      setStormActive(false);
+      setQuestToast({ kicker: 'SİMÜLASYON TAMAMLANDI', text: 'Yağış kesildi. Islak zemin ve kalan su, modeldeki drenaj hızına göre toparlanıyor.' });
+      setTimeout(() => setQuestToast(null), 4200);
+    }
+  }, [activeDefenses, chapterOutcome, failChapter, questStep, spatialState.hospitalRoadThreshold, spatialState.isCompleted, spatialState.metrics.peakHospitalRoadWaterDepth, stormActive]);
+
+  useEffect(() => {
+    gameAudio.setWeatherPhase(weather.phase);
+  }, [weather.phase]);
 
   // (Otomatik zorunlu ilerleme kaldırıldı — Oyuncu dünyada serbestçe yürüyüp hedeflerle doğrudan etkileşime geçer)
 
@@ -814,7 +1598,6 @@ export function ExplorableWorld({
 
     let animId: number;
     let lastTime = performance.now();
-    let stepCount = 0;
 
     const gameLoop = (currentTime: number) => {
       const dt = Math.min(0.05, (currentTime - lastTime) / 1000);
@@ -822,103 +1605,121 @@ export function ExplorableWorld({
       const timeInSec = currentTime * 0.001;
 
       // 1. Oyuncu Hareketi (Klavye + Sanal Joystick)
-      let dx = 0;
-      let dy = 0;
-
-      if (keysDown.current['w'] || keysDown.current['arrowup']) dy -= 1;
-      if (keysDown.current['s'] || keysDown.current['arrowdown']) dy += 1;
-      if (keysDown.current['a'] || keysDown.current['arrowleft']) dx -= 1;
-      if (keysDown.current['d'] || keysDown.current['arrowright']) dx += 1;
-
-      if (touchMovement.active) {
-        dx = touchMovement.dx;
-        dy = touchMovement.dy;
+      const movementLocked = Boolean(isPausedRef.current || activeDialogRef.current || showHeroModalRef.current || chapterWonRef.current || chapterOutcomeRef.current);
+      const movementInput = movementLocked
+        ? { x: 0, y: 0 }
+        : getMovementInput(keysDown.current, {
+            x: touchMovementRef.current.dx,
+            y: touchMovementRef.current.dy,
+            active: touchMovementRef.current.active,
+          });
+      const nextPlayer = movePlayer(
+        playerRef.current,
+        movementInput,
+        dt,
+        obstacles,
+        trees,
+        WORLD_WIDTH,
+        WORLD_HEIGHT,
+        spatialStateRef.current.hospitalRoadWaterDepth,
+        WORLD_TERRAIN_MASK,
+      );
+      let appliedPlayer = nextPlayer;
+      const attemptedTerrainPoint = {
+        x: playerRef.current.x + movementInput.x * 12,
+        y: playerRef.current.y + movementInput.y * 12,
+      };
+      const attemptedTerrainBlock = Boolean(
+        movementInput.x || movementInput.y,
+      ) && pointInBlockedTerrain(attemptedTerrainPoint, WORLD_TERRAIN_MASK);
+      if (attemptedTerrainBlock && currentTime - terrainBlockedFeedbackRef.current > 1200) {
+        terrainBlockedFeedbackRef.current = currentTime;
+        setQuestToast({ kicker: 'KIYI SINIRI', text: 'Suya geçiş kapalı. Rıhtım veya işaretli iskele yolunu kullan.' });
+        window.setTimeout(() => setQuestToast(null), 1800);
       }
-
-      // Normalizasyon
-      const len = Math.hypot(dx, dy);
-      let isMoving = false;
-      let facing = player.facing;
-
-      if (len > 0.1) {
-        isMoving = true;
-        const normDx = dx / len;
-        const normDy = dy / len;
-        const speed = 210; // px/s
-
-        let nextX = player.x + normDx * speed * dt;
-        let nextY = player.y + normDy * speed * dt;
-
-        if (Math.abs(normDx) > Math.abs(normDy)) {
-          facing = normDx > 0 ? 'right' : 'left';
-        } else {
-          facing = normDy > 0 ? 'down' : 'up';
+      const deepFlood = spatialStateRef.current.hospitalRoadWaterDepth > 30;
+      const isStranded = deepFlood
+        && pointInFloodedRoadZone(playerRef.current, spatialStateRef.current.hospitalRoadWaterDepth)
+        && (Math.abs(movementInput.x) > 0.01 || Math.abs(movementInput.y) > 0.01)
+        && Math.hypot(nextPlayer.x - playerRef.current.x, nextPlayer.y - playerRef.current.y) < 0.5;
+      if (isStranded) {
+        stalledFloodSecondsRef.current += dt;
+        if (stalledFloodSecondsRef.current >= 1.5) {
+          appliedPlayer = {
+            ...playerRef.current,
+            x: 1180,
+            y: 420,
+            vx: 0,
+            vy: 0,
+            isMoving: false,
+            frame: 0,
+          };
+          stalledFloodSecondsRef.current = 0;
+          setRescueCount((count) => count + 1);
+          setQuestToast({ kicker: 'EKO / GÜVENLİ TAHLİYE', text: 'Taşkın çukurundan güvenli patikaya çıkarıldın. Bir rescue puanı kaydedildi.' });
+          gameAudio.effect('error');
+          setTimeout(() => setQuestToast(null), 3600);
         }
-
-        // Çarpışma Tespiti
-        const playerRadius = 14;
-        let collidedX = false;
-        let collidedY = false;
-
-        for (const obs of obstacles) {
-          if (
-            nextX + playerRadius > obs.x &&
-            nextX - playerRadius < obs.x + obs.w &&
-            player.y + playerRadius > obs.y &&
-            player.y - playerRadius < obs.y + obs.h
-          ) {
-            collidedX = true;
-          }
-          if (
-            player.x + playerRadius > obs.x &&
-            player.x - playerRadius < obs.x + obs.w &&
-            nextY + playerRadius > obs.y &&
-            nextY - playerRadius < obs.y + obs.h
-          ) {
-            collidedY = true;
-          }
-        }
-
-        const finalX = collidedX
-          ? player.x
-          : Math.max(playerRadius, Math.min(WORLD_WIDTH - playerRadius, nextX));
-        const finalY = collidedY
-          ? player.y
-          : Math.max(playerRadius, Math.min(WORLD_HEIGHT - playerRadius, nextY));
-
-        stepCount += dt * 10;
-
-        setPlayer({
-          x: finalX,
-          y: finalY,
-          vx: normDx * speed,
-          vy: normDy * speed,
-          facing,
-          isMoving,
-          frame: Math.floor(stepCount) % 4,
-        });
       } else {
-        setPlayer((prev) => ({ ...prev, isMoving: false }));
+        stalledFloodSecondsRef.current = 0;
       }
+      if (spatialStateRef.current.hospitalRoadWaterDepth <= 30 && appliedPlayer.isMoving) {
+        lastSafePlayerRef.current = { x: appliedPlayer.x, y: appliedPlayer.y };
+      }
+      playerRef.current = appliedPlayer;
+      setPlayer(appliedPlayer);
+      const enteredDistrict = getCityDistrictAt(appliedPlayer.x, appliedPlayer.y);
+      if (enteredDistrict.id !== currentDistrictRef.current) {
+        currentDistrictRef.current = enteredDistrict.id;
+        setCurrentDistrictId(enteredDistrict.id);
+        setDiscoveredDistricts((previous) => {
+          if (previous.has(enteredDistrict.id)) return previous;
+          const next = new Set(previous);
+          next.add(enteredDistrict.id);
+          setQuestToast({
+            kicker: 'YENİ BÖLGE KEŞFEDİLDİ',
+            text: `${enteredDistrict.name} — ${enteredDistrict.subtitle}`,
+          });
+          gameAudio.effect('transition');
+          setTimeout(() => setQuestToast((current) => (
+            current?.kicker === 'YENİ BÖLGE KEŞFEDİLDİ' ? null : current
+          )), 3200);
+          return next;
+        });
+      }
+      if (!spatialStateRef.current.hospitalRoadPassable) setHadRoadClosure(true);
 
       // 2. Yakın Etkileşim Kontrolü
       let closest: InteractionPoint | null = null;
       let minDist = Infinity;
-      for (const pt of interactionPoints) {
-        const d = Math.hypot(player.x - pt.x, player.y - pt.y);
-        if (d < pt.radius && d < minDist) {
-          closest = pt;
-          minDist = d;
+      const questTargetInteraction = interactionPointsRef.current.find((pt) => (
+        Math.hypot(pt.x - targetPointRef.current.x, pt.y - targetPointRef.current.y) < 1
+        && Math.hypot(playerRef.current.x - pt.x, playerRef.current.y - pt.y) < pt.radius
+      ));
+      if (questTargetInteraction) {
+        closest = questTargetInteraction;
+        minDist = Math.hypot(playerRef.current.x - questTargetInteraction.x, playerRef.current.y - questTargetInteraction.y);
+      }
+      if (!questTargetInteraction) {
+        for (const pt of interactionPointsRef.current) {
+          const d = Math.hypot(playerRef.current.x - pt.x, playerRef.current.y - pt.y);
+          if (d < pt.radius && d < minDist) {
+            closest = pt;
+            minDist = d;
+          }
         }
       }
       setNearbyInteraction(closest);
+      if (closest?.defenseId && !discoveredSolutionsRef.current.includes(closest.defenseId)) {
+        discoverSolution(closest.defenseId, `${closest.label} saha işareti`);
+      }
 
       // 2.1. Yakın Şehir Sakini Kontrolü (Ambient Citizen)
       let closestCit: AmbientCitizen | null = null;
       if (!closest) {
         let minCitD = 48;
         for (const c of citizensRef.current) {
-          const d = Math.hypot(player.x - c.x, player.y - c.y);
+          const d = Math.hypot(playerRef.current.x - c.x, playerRef.current.y - c.y);
           if (d < minCitD) {
             closestCit = c;
             minCitD = d;
@@ -929,31 +1730,25 @@ export function ExplorableWorld({
 
       // 2.2. Yaşayan Şehir Sakinlerini Güncelle (Ambient Citizens System)
       updateAmbientCitizens(citizensRef.current, dt, {
-        stormActive,
-        roadWaterDepth: spatialState.hospitalRoadWaterDepth,
-        roadPassable: spatialState.hospitalRoadPassable,
-        hasSpongeDefense: activeDefenses.includes('sünger'),
-        chapterWon,
+        stormActive: stormActiveRef.current,
+        weatherPhase: weatherRef.current.phase,
+        roadWaterDepth: spatialStateRef.current.hospitalRoadWaterDepth,
+        roadPassable: spatialStateRef.current.hospitalRoadPassable,
+        hasSpongeDefense: activeDefensesRef.current.includes('sünger'),
+        chapterWon: chapterWonRef.current,
         obstacles,
-        playerX: player.x,
-        playerY: player.y,
+        terrainMask: WORLD_TERRAIN_MASK,
+        playerX: playerRef.current.x,
+        playerY: playerRef.current.y,
       });
-
-      // 3. Akıllı A* Yol Çıkarımı (Smart Navigation Route)
-      const currentRoute = findNavRoute(
-        { x: player.x, y: player.y },
-        targetPoint,
-        obstacles,
-        spatialState.hospitalRoadWaterDepth
-      );
 
       // 4. ÇİZİM (Pixel-Art Rendering)
       const width = canvas.width;
       const height = canvas.height;
 
       // Kamera
-      const curCamX = Math.max(0, Math.min(WORLD_WIDTH - width, player.x - width / 2));
-      const curCamY = Math.max(0, Math.min(WORLD_HEIGHT - height, player.y - height / 2));
+      const curCamX = Math.max(0, Math.min(WORLD_WIDTH - width, playerRef.current.x - width / 2));
+      const curCamY = Math.max(0, Math.min(WORLD_HEIGHT - height, playerRef.current.y - height / 2));
 
       ctx.save();
       ctx.translate(-curCamX, -curCamY);
@@ -965,36 +1760,38 @@ export function ExplorableWorld({
         camY: curCamY,
         viewWidth: width,
         viewHeight: height,
-        activeDefenses,
-        roadWaterDepth: spatialState.hospitalRoadWaterDepth,
-        roadPassable: spatialState.hospitalRoadPassable,
-        stormActive,
-        questStep,
-        targetObjective: currentQuest
-          ? { x: currentQuest.targetX, y: currentQuest.targetY, label: currentQuest.targetLabel }
+        activeDefenses: activeDefensesRef.current,
+        roadWaterDepth: spatialStateRef.current.hospitalRoadWaterDepth,
+        roadWetness: spatialStateRef.current.roadWetness,
+        spongeStorage: spatialStateRef.current.spongeStorage,
+        spongeStorageCapacity: spatialStateRef.current.spongeStorageCapacity,
+        roadPassable: spatialStateRef.current.hospitalRoadPassable,
+        stormActive: stormActiveRef.current,
+        weatherPhase: weatherRef.current.phase,
+        rainIntensity: weatherRef.current.rainIntensity,
+        cloudDarkness: weatherRef.current.cloudDarkness,
+        windStrength: weatherRef.current.windStrength,
+        questStep: questStepRef.current,
+        targetObjective: currentQuestRef.current
+          ? {
+              x: currentQuestRef.current.targetX,
+              y: currentQuestRef.current.targetY,
+              label: currentQuestRef.current.targetLabel,
+            }
           : null,
       };
 
       // A. Piksel Karo Haritası & Yollar & Taşkın Katmanı
       drawPixelWorldMap(renderCtx, WORLD_WIDTH, WORLD_HEIGHT);
 
-      // B. Altın Görev İzi (Golden Quest Trail) — Dinamik A* Rota & Parçacık Akışı
-      drawGoldenQuestTrail(
-        ctx,
-        currentRoute,
-        { x: player.x, y: player.y },
-        timeInSec,
-        Math.hypot(player.x - targetPoint.x, player.y - targetPoint.y)
-      );
-
-      // C. Altyapı ve İnteraktif Zemin Nesneleri
+      // B. Altyapı ve İnteraktif Zemin Nesneleri
       // Drenaj Menfezi
       drawPixelStormGrate(
         ctx,
         1290,
         510,
-        questStep >= 4,
-        spatialState.hospitalRoadWaterDepth
+        questStepRef.current >= 4,
+        spatialStateRef.current.hospitalRoadWaterDepth
       );
 
       // Sünger Kent İnşa Alanı
@@ -1002,9 +1799,11 @@ export function ExplorableWorld({
         ctx,
         1160,
         340,
-        activeDefenses.includes('sünger'),
+        activeDefensesRef.current.includes('sünger'),
         'sponge',
-        timeInSec
+        timeInSec,
+        spatialStateRef.current.spongeStorage,
+        spatialStateRef.current.spongeStorageCapacity,
       );
 
       // Yükseltilmiş Menfez İnşa Alanı
@@ -1012,8 +1811,26 @@ export function ExplorableWorld({
         ctx,
         1340,
         530,
-        activeDefenses.includes('dönüşüm'),
+        activeDefensesRef.current.includes('dönüşüm'),
         'retrofit',
+        timeInSec
+      );
+
+      drawPixelInterventionSite(
+        ctx,
+        900,
+        340,
+        activeDefensesRef.current.includes('uyarı'),
+        'retrofit',
+        timeInSec
+      );
+
+      drawPixelInterventionSite(
+        ctx,
+        1800,
+        620,
+        activeDefensesRef.current.includes('set'),
+        'seawall',
         timeInSec
       );
 
@@ -1046,8 +1863,8 @@ export function ExplorableWorld({
             1360,
             240,
             timeInSec,
-            stormActive,
-            spatialState.hospitalRoadPassable
+            stormActiveRef.current,
+            spatialStateRef.current.hospitalRoadPassable
           ),
       });
 
@@ -1081,8 +1898,8 @@ export function ExplorableWorld({
 
       // 8. Seçilen Oyuncu Kahramanı (Deniz veya Barış)
       entities.push({
-        baseY: player.y + 16,
-        draw: () => drawPixelHero(ctx, player, heroType, timeInSec),
+        baseY: playerRef.current.y + 16,
+        draw: () => drawPixelHero(ctx, playerRef.current, heroTypeRef.current, timeInSec),
       });
 
       // 9. Yaşayan Şehir Sakinleri (Ambient Citizens)
@@ -1125,32 +1942,27 @@ export function ExplorableWorld({
       }
 
       // E. Aktif Görev Hedef İşareti (Kontekstüel İkon & Parıltı)
-      if (currentQuest) {
+      if (currentQuestRef.current) {
         drawPixelQuestWaypoint(
           ctx,
-          currentQuest.targetX,
-          currentQuest.targetY,
-          currentQuest.targetLabel,
+          currentQuestRef.current.targetX,
+          currentQuestRef.current.targetY,
+          currentQuestRef.current.targetLabel,
           timeInSec,
-          questStep
+          questStepRef.current
         );
       }
 
-      // F. Fırtına Yağmur Parçacıkları
-      if (stormActive) {
-        ctx.strokeStyle = 'rgba(186, 230, 253, 0.45)';
-        ctx.lineWidth = 1.5;
-        for (let i = 0; i < 120; i++) {
-          const rx = (i * 47 + timeInSec * 700) % width + curCamX;
-          const ry = (i * 31 + timeInSec * 1300) % height + curCamY;
-          ctx.beginPath();
-          ctx.moveTo(rx, ry);
-          ctx.lineTo(rx - 8, ry + 20);
-          ctx.stroke();
-        }
-      }
-
       ctx.restore();
+
+      // Weather is drawn in screen coordinates so rain remains visible while
+      // the camera moves, and never drifts with world-space offsets.
+      drawPixelWeatherOverlay(ctx, width, height, timeInSec, {
+        weatherPhase: weatherRef.current.phase,
+        rainIntensity: weatherRef.current.rainIntensity,
+        cloudDarkness: weatherRef.current.cloudDarkness,
+        windStrength: weatherRef.current.windStrength,
+      });
 
       // 5. MİNİMAP RADAR ÇİZİMİ (Mini Canvas Engine)
       const radar = radarCanvasRef.current;
@@ -1184,7 +1996,7 @@ export function ExplorableWorld({
           rctx.stroke();
 
           // Sel Baskını Tehlike Alanı (Kritikse Kırmızı Vurgu)
-          if (spatialState.hospitalRoadWaterDepth > 28) {
+          if (spatialStateRef.current.hospitalRoadWaterDepth > 28) {
             rctx.fillStyle = 'rgba(239, 68, 68, 0.65)';
             rctx.fillRect(1140 * sx, 480 * sy, 180 * sx, 100 * sy);
           }
@@ -1195,29 +2007,17 @@ export function ExplorableWorld({
             rctx.fillRect(obs.x * sx, obs.y * sy, obs.w * sx, obs.h * sy);
           }
 
-          // Aktif Altın Rota İzi Önizlemesi
-          if (currentRoute && currentRoute.length >= 2) {
-            rctx.strokeStyle = '#fbbf24';
-            rctx.lineWidth = 1.6;
-            rctx.beginPath();
-            rctx.moveTo(player.x * sx, player.y * sy);
-            for (let i = 1; i < currentRoute.length; i++) {
-              rctx.lineTo(currentRoute[i].x * sx, currentRoute[i].y * sy);
-            }
-            rctx.stroke();
-          }
-
           // Aktif Görev Hedef Noktası (Yanıp Sönen Sarı Nokta)
           const targetPulse = 0.8 + 0.3 * Math.sin(timeInSec * 6);
           rctx.fillStyle = '#f59e0b';
           rctx.beginPath();
-          rctx.arc(targetPoint.x * sx, targetPoint.y * sy, 3.5 * targetPulse, 0, Math.PI * 2);
+          rctx.arc(targetPointRef.current.x * sx, targetPointRef.current.y * sy, 3.5 * targetPulse, 0, Math.PI * 2);
           rctx.fill();
 
           // Oyuncu Noktası (Mavi Işık)
           rctx.fillStyle = '#38bdf8';
           rctx.beginPath();
-          rctx.arc(player.x * sx, player.y * sy, 3, 0, Math.PI * 2);
+          rctx.arc(playerRef.current.x * sx, playerRef.current.y * sy, 3, 0, Math.PI * 2);
           rctx.fill();
         }
       }
@@ -1227,34 +2027,22 @@ export function ExplorableWorld({
 
     animId = requestAnimationFrame(gameLoop);
     return () => cancelAnimationFrame(animId);
-  }, [
-    player,
-    obstacles,
-    trees,
-    streetLamps,
-    interactionPoints,
-    nearbyInteraction,
-    activeDefenses,
-    spatialState,
-    stormActive,
-    touchMovement,
-    questStep,
-    currentQuest,
-    targetPoint,
-    heroType,
-    chapterWon,
-  ]);
+  }, [discoverSolution, investigateSolution, obstacles, streetLamps, trees]);
 
   // Sanal Joystick Touch Eventleri (Mobil için)
   const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.preventDefault();
     const touch = e.touches[0];
+    if (!touch) return;
     joystickBaseRef.current = { startX: touch.clientX, startY: touch.clientY };
     setTouchMovement({ dx: 0, dy: 0, active: true });
   };
 
   const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    e.preventDefault();
     if (!joystickBaseRef.current) return;
     const touch = e.touches[0];
+    if (!touch) return;
     const rawDx = touch.clientX - joystickBaseRef.current.startX;
     const rawDy = touch.clientY - joystickBaseRef.current.startY;
     const dist = Math.hypot(rawDx, rawDy);
@@ -1270,8 +2058,44 @@ export function ExplorableWorld({
     setTouchMovement({ dx: 0, dy: 0, active: false });
   };
 
+  const interactionRequiresHold = requiresHoldToInteract(nearbyInteraction);
+  const interactionProgress = interactionHold && interactionHold.pointId === nearbyInteraction?.id
+    ? interactionHold.progress
+    : 0;
+  const nearbyDefense = nearbyInteraction?.defenseId
+    ? DEFENSES.find((defense) => defense.id === nearbyInteraction.defenseId)
+    : null;
+  const nearbyDefenseGuidance = nearbyDefense ? DEFENSE_GUIDANCE[nearbyDefense.id] : null;
+  const handleInteractionClick = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (requiresHoldToInteract(nearbyInteractionRef.current)) {
+      event.preventDefault();
+      return;
+    }
+    handleInteract();
+  }, [handleInteract]);
+  const handleHoldPointerDown = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!requiresHoldToInteract(nearbyInteractionRef.current)) return;
+    event.preventDefault();
+    startInteractionHold();
+  }, [startInteractionHold]);
+  const handleHoldPointerUp = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!requiresHoldToInteract(nearbyInteractionRef.current)) return;
+    event.preventDefault();
+    finishInteractionHold();
+  }, [finishInteractionHold]);
+  const handleHoldPointerCancel = useCallback((event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (!requiresHoldToInteract(nearbyInteractionRef.current)) return;
+    event.preventDefault();
+    cancelInteractionHold(true);
+  }, [cancelInteractionHold]);
+
+  const outcomePresentation = chapterOutcome ? getOutcomePresentation(chapterOutcome) : null;
+  const recordedPeakWater = Math.max(0, spatialState.metrics.peakHospitalRoadWaterDepth);
+  const recordedCurrentWater = Math.max(0, spatialState.hospitalRoadWaterDepth);
+  const comparisonScale = Math.max(38, recordedPeakWater, recordedCurrentWater);
+
   return (
-    <div className="explorable-world-container">
+    <div className={`explorable-world-container ${endingVisible ? 'ending-active' : ''}`}>
       {/* 1. Üst HUD Barı */}
       <header className="world-hud-top">
         <div className="hud-brand-group">
@@ -1302,9 +2126,42 @@ export function ExplorableWorld({
           >
             <RotateCcw size={13} /> SIFIRLA
           </button>
+          <div className="hud-location-label" data-current-district={currentDistrict.id}>
+            <small>ŞU AN BURADASIN</small>
+            <b>{currentDistrict.name}</b>
+            <span>{discoveredDistricts.size} / {CITY_DISTRICTS.length} bölge keşfedildi</span>
+          </div>
         </div>
 
         <div className="hud-status-group">
+          <div
+            className={`hud-weather-badge weather-${weather.phase.toLowerCase()}`}
+            data-weather-phase={weather.phase}
+            data-rain-intensity={weather.rainIntensity.toFixed(2)}
+          >
+            <small>HAVA DURUMU</small>
+            <b>{weatherPhaseLabel(weather.phase)}</b>
+            <span>{weather.rainfallRate} mm/h</span>
+          </div>
+          <button
+            className="hud-mode-toggle"
+            onClick={() => setGameMode((mode) => mode === 'relaxed' ? 'adventure' : 'relaxed')}
+            title="Oyun modunu değiştir"
+            data-game-mode={gameMode}
+          >
+            <small>MOD</small>
+            <b>{gameMode === 'adventure' ? 'MACERA' : 'RAHAT KEŞİF'}</b>
+            {gameMode === 'adventure' && <span>{Math.max(0, 240 - Math.floor(stormElapsedSeconds))} sn</span>}
+          </button>
+          <button
+            className="hud-pause-btn"
+            onClick={() => setIsPaused((paused) => !paused)}
+            aria-label={isPaused ? 'Oyuna devam et' : 'Oyunu duraklat'}
+            title={isPaused ? 'Oyuna devam et' : 'Oyunu duraklat'}
+          >
+            {isPaused ? '▶ DEVAM' : 'Ⅱ DURAKLAT'}
+          </button>
+          <span className="hud-meta-divider">/</span>
           <div className="hud-meta-item">
             <small>KALAN KAYNAK</small>
             <b>{BUDGET - budgetUsed} / 100 Kr</b>
@@ -1324,11 +2181,24 @@ export function ExplorableWorld({
               )}
             </b>
           </div>
-          {onOpenStrategy && (
-            <button className="hud-strategy-btn" onClick={onOpenStrategy}>
-              <Shield size={14} /> TAKTİK HARİTA
-            </button>
+          {activeDefenses.includes('sünger') && (
+            <div className="hud-meta-item hud-sponge-meter" data-sponge-meter>
+              <small>GÖLET DOLULUĞU</small>
+              <b>{spatialState.spongeStorage.toFixed(1)} / {spatialState.spongeStorageCapacity} cm</b>
+              <span>{spatialState.spongeOperational ? 'AKTİF' : `KURULUYOR · ${spatialState.spongeDeploymentTicksRemaining}`}</span>
+            </div>
           )}
+          <button
+            className="hud-strategy-btn solution-journal-launch"
+            title="Şehri Koruma Planı'nı aç (P)"
+            onClick={() => {
+              setPendingPlan(activeDefenses);
+              setPlanningOpen(true);
+            }}
+            data-solution-journal-open="true"
+          >
+            <Sparkles size={14} /> ŞEHİR PLANI <kbd>P</kbd>
+          </button>
           <button
             className="sound-button"
             onClick={onToggleMute}
@@ -1340,30 +2210,136 @@ export function ExplorableWorld({
       </header>
 
       {/* 2. Yeniden Tasarlanan RPG Görev Takip Paneli (Sol Üst) */}
-      <div className="quest-tracker-card">
+      <div className={`quest-tracker-card ${questDetailsExpanded ? 'quest-expanded' : 'quest-collapsed'}`}>
         <div className="quest-tracker-header">
           <span className="quest-chapter-tag">BÖLÜM 1: YAMAÇ HASTANESİ</span>
-          <span className="quest-step-pill">{currentQuest.kicker}</span>
+          <div className="quest-header-actions">
+            <span className="quest-step-pill">{currentQuest.kicker}</span>
+            <button
+              className="quest-collapse-btn"
+              onClick={() => setQuestDetailsExpanded((expanded) => !expanded)}
+              aria-expanded={questDetailsExpanded}
+              aria-controls="quest-details"
+              aria-label={questDetailsExpanded ? 'Görev ayrıntısını gizle' : 'Görev ayrıntısını aç'}
+            >
+              {questDetailsExpanded ? '−' : '+'}
+            </button>
+          </div>
         </div>
         <div className="quest-tracker-title">
           <span>⚔️</span> {currentQuest.title}
         </div>
-        <div className="quest-tracker-desc">{currentQuest.description}</div>
-        <div className="quest-tracker-footer">
-          <div className="quest-target-distance-badge">
-            <Navigation size={11} style={{ transform: 'rotate(45deg)' }} />
-            <span>{currentQuest.targetLabel}</span>
-            <span className="quest-distance-val">• {distanceMeters} m</span>
+        {questDetailsExpanded && (
+          <div id="quest-details" className="quest-details-content">
+            <div className="quest-tracker-desc">{currentQuest.description}</div>
+            <div className="quest-tracker-footer">
+              <div className="quest-target-distance-badge">
+                <Navigation size={11} style={{ transform: 'rotate(45deg)' }} />
+                <span>{currentQuest.targetLabel}</span>
+                <span className="quest-distance-val">• {distanceMeters} m</span>
+              </div>
+              <button
+                className="quest-hint-toggle-btn"
+                onClick={() => setShowEkoHint((prev) => !prev)}
+                title="EKO Akıllı İpucunu Göster"
+              >
+                <Sparkles size={11} /> {showEkoHint ? 'GİZLE' : 'İPUCU (EKO)'}
+              </button>
+            </div>
           </div>
-          <button
-            className="quest-hint-toggle-btn"
-            onClick={() => setShowEkoHint((prev) => !prev)}
-            title="EKO Akıllı İpucunu Göster"
-          >
-            <Sparkles size={11} /> {showEkoHint ? 'GİZLE' : 'İPUCU (EKO)'}
-          </button>
-        </div>
+        )}
       </div>
+
+      {planningOpen && (
+        <div className="solution-journal-overlay" role="dialog" aria-label="Şehri Koruma Planı">
+          <section className="solution-journal-card">
+            <header className="solution-journal-header">
+              <div>
+                <div className="solution-journal-brandline">
+                  <span className="solution-journal-brand-mark">♜</span>
+                  <strong>ŞEHRİN YARINI</strong>
+                  <span className="solution-journal-brand-arrow">—✣—</span>
+                  <em>Planlama Günlüğü</em>
+                </div>
+                <span className="solution-journal-kicker">PLANLAMA GÜNLÜĞÜ</span>
+                <h2>ŞEHRİ KORUMA PLANI</h2>
+                <p>Önce çözümleri araştır, sonra bütçene ve riskin konumuna göre karar ver.</p>
+              </div>
+              <div className="solution-journal-header-art" aria-hidden="true">
+                <img src="/assets/chapters/yamac-hastanesi.svg" alt="" />
+              </div>
+              <div className="solution-journal-bookmark" aria-hidden="true">♨</div>
+              <button className="solution-journal-close" onClick={() => setPlanningOpen(false)} aria-label="Şehir planını kapat">×</button>
+            </header>
+            <div className="solution-journal-progress">
+              <span>{getDiscoveryProgress(discoveredSolutions)}</span>
+              <span>PLAN: {plannedBudgetUsed} / {BUDGET} Kr</span>
+              <span>KALAN: {BUDGET - plannedBudgetUsed} Kr</span>
+            </div>
+            <div className="solution-journal-grid">
+              {CLIMATE_SOLUTIONS.map((solution) => {
+                const state = getSolutionState(solution.id, discoveredSolutions, investigatedSolutions, activeDefenses);
+                const selectedInPlan = pendingPlan.includes(solution.id);
+                const stateLabel = state === 'LOCKED'
+                  ? 'PLANDAN ARAŞTIRILABİLİR'
+                  : state === 'DISCOVERED'
+                    ? 'İNCELEME GEREKİYOR'
+                    : state === 'BUILT'
+                      ? 'KURULU'
+                      : 'HAZIR';
+                return (
+                  <article
+                    key={solution.id}
+                    className={`solution-journal-item state-${state.toLowerCase()} ${selectedInPlan ? 'is-selected' : ''}`}
+                    data-solution-id={solution.id}
+                    data-solution-state={state}
+                  >
+                    <div className={`solution-art solution-art-${solution.id}`} aria-label={`${solution.name} görseli`} role="img">
+                      <span className="solution-art-symbol" aria-hidden="true">{solution.icon}</span>
+                    </div>
+                    <div className="solution-journal-copy">
+                      <div className="solution-journal-title-row">
+                        <h3><span className="solution-title-icon" aria-hidden="true">{solution.icon}</span>{solution.name}</h3>
+                        <strong>{solution.cost} Kr</strong>
+                      </div>
+                      <span className="solution-journal-state">{stateLabel}</span>
+                      <p>{solution.benefit}</p>
+                      <small><b>Korur:</b> {solution.protects}</small>
+                      <small><b>Sınır:</b> {solution.limitation}</small>
+                      <small><b>Yer:</b> {solution.validZones.join(' · ')}</small>
+                      {(state === 'LOCKED' || state === 'DISCOVERED') && <small className="solution-journal-discovery">{solution.discoveryMethod} · Plan ekranından araştırıp ekleyebilirsin.</small>}
+                      <button
+                        className="solution-journal-action"
+                        onClick={() => togglePlannedSolution(solution.id)}
+                      >
+                        {selectedInPlan ? 'PLANDAN ÇIKAR' : 'PLANA EKLE'}
+                      </button>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+            <footer className="solution-journal-footer">
+              <span>{planConfirmed ? 'Son onaylı plan simülasyonda uygulanıyor.' : 'Planı onaylayana kadar bütçe harcanmaz.'}</span>
+              <div>
+                <button className="dialog-close-btn" onClick={() => setPlanningOpen(false)}>VAZGEÇ</button>
+                <button className="primary-button" onClick={confirmPlanningJournal}>PLANI ONAYLA ↗</button>
+              </div>
+            </footer>
+          </section>
+        </div>
+      )}
+
+      {showFirstMissionGuide && questStep === 1 && !activeDialog && (
+        <aside className="first-mission-guide" aria-label="İlk saha kılavuzu">
+          <button className="first-mission-guide-close" onClick={dismissFirstMissionGuide} aria-label="Kılavuzu kapat">×</button>
+          <strong>İLK SAHA KILAVUZU</strong>
+          <span><b>WASD / joystick:</b> hareket · <b>E:</b> konuş</span>
+          <span><b>Menfez ve yatırımlarda E’yi basılı tut:</b> ilerleme tamamlanınca işlem gerçekleşir.</span>
+          <span><b>Pusula:</b> hedefi gösterir. Fırtına öncesi savunma kur, yolu doğrula ve Mira’ya rapor ver.</span>
+          <small>Yıldızlar planının kalitesini, rozetler keşif ve doğru müdahaleleri gösterir.</small>
+        </aside>
+      )}
 
       {/* 3. EKO Kural Tabanlı Yardımcı İpucu Kartı */}
       {showEkoHint && (
@@ -1389,32 +2365,57 @@ export function ExplorableWorld({
         </div>
       )}
 
-      {/* 4. Ekran Dışı Yön Oku (Off-Screen Compass Direction Arrow) */}
-      {offScreenIndicator.isOffScreen && (
-        <div
-          className="offscreen-compass-arrow"
-          style={{
-            left: `${offScreenIndicator.screenX}px`,
-            top: `${offScreenIndicator.screenY}px`,
-          }}
-          onClick={() => setShowEkoHint(true)}
-          title={`${currentQuest.targetLabel} yönü — İpucu için tıkla`}
+      {/* 4. Kompakt RPG Pusulası */}
+      {showCompass ? (
+        <aside
+          className={`rpg-compass ${targetReached ? 'compass-reached' : ''}`}
+          aria-label={`Aktif hedef: ${currentQuest.targetLabel}`}
+          data-compass-bearing={compassBearing.angleDeg.toFixed(2)}
+          data-compass-distance={compassBearing.distanceMeters}
+          data-compass-target={currentQuest.targetLabel}
+          data-compass-reached={targetReached ? 'true' : 'false'}
         >
-          <div
-            className="compass-chevron"
-            style={{ transform: `rotate(${offScreenIndicator.angleDeg}deg)` }}
-          >
-            <Navigation size={18} />
+          <div className="rpg-compass-header">
+            <span>HEDEF PUSULASI</span>
+            <button
+              className="compass-hide-button"
+              onClick={() => setShowCompass(false)}
+              aria-label="Pusulayı kapat"
+            >
+              ×
+            </button>
           </div>
-          <div className="compass-label-pill">
-            <span>{currentQuest.targetLabel}</span>
-            <strong>{offScreenIndicator.distanceMeters} m</strong>
+          <div className="rpg-compass-dial" aria-hidden="true">
+            <span className="compass-cardinal compass-north">N</span>
+            <span className="compass-cardinal compass-east">E</span>
+            <span className="compass-cardinal compass-south">S</span>
+            <span className="compass-cardinal compass-west">W</span>
+            {!targetReached && (
+              <span
+                className="compass-pointer"
+                style={{ transform: `rotate(${compassBearing.angleDeg}deg)` }}
+              />
+            )}
+            <span className="compass-center-dot" />
           </div>
-        </div>
+          <div className="rpg-compass-target">{targetReached ? nearbyInteraction?.label : currentQuest.targetLabel}</div>
+          <div className="rpg-compass-meta">
+            {targetReached ? 'E HAZIR • ETKİLEŞİME GEÇ' : `HEDEF • ${compassBearing.distanceMeters} m • ${compassBearing.cardinal}`}
+          </div>
+          {navigationWarning && <div className="rpg-compass-warning">{navigationWarning}</div>}
+        </aside>
+      ) : (
+        <button
+          className="compass-show-button"
+          onClick={() => setShowCompass(true)}
+          aria-label="Pusulayı aç"
+        >
+          PUSULA
+        </button>
       )}
 
       {/* 5. Görev Geçiş ve Başarı Toast Bildirimi */}
-      {questToast && (
+      {questToast && !activeDialog && !achievementNotice && (
         <div className="quest-toast-banner">
           <span className="quest-toast-icon">
             <CheckCircle size={18} />
@@ -1432,6 +2433,37 @@ export function ExplorableWorld({
         width={canvasSize.width}
         height={canvasSize.height}
         className="world-canvas"
+        tabIndex={0}
+        role="application"
+        aria-label="Şehrin Yarını şehir oyun alanı. WASD veya ok tuşlarıyla hareket et."
+        data-player-x={player.x.toFixed(2)}
+        data-player-y={player.y.toFixed(2)}
+        data-player-facing={player.facing}
+        data-player-moving={player.isMoving ? 'true' : 'false'}
+        data-current-district={currentDistrict.id}
+        data-discovered-districts={[...discoveredDistricts].join(',')}
+        data-discovered-solutions={discoveredSolutions.join(',')}
+        data-investigated-solutions={investigatedSolutions.join(',')}
+        data-selected-plan={pendingPlan.join(',')}
+        data-plan-confirmed={planConfirmed ? 'true' : 'false'}
+        data-weather-phase={weather.phase}
+        data-flood-depth={spatialState.hospitalRoadWaterDepth.toFixed(1)}
+        data-spatial-tick={spatialState.tick}
+        data-peak-flood-depth={spatialState.metrics.peakHospitalRoadWaterDepth.toFixed(1)}
+        data-time-above-threshold={spatialState.metrics.timeAboveRoadThreshold.toFixed(2)}
+        data-sponge-captured={spatialState.metrics.spongeCapturedWater.toFixed(1)}
+        data-road-passable={spatialState.hospitalRoadPassable ? 'true' : 'false'}
+        data-had-road-closure={hadRoadClosure ? 'true' : 'false'}
+        data-road-wetness={spatialState.roadWetness.toFixed(3)}
+        data-sponge-storage={spatialState.spongeStorage.toFixed(1)}
+        data-sponge-operational={spatialState.spongeOperational ? 'true' : 'false'}
+        data-interaction-hold-progress={interactionProgress.toFixed(2)}
+        data-interaction-hold-active={interactionHold ? 'true' : 'false'}
+        data-storm-time={stormElapsedSeconds.toFixed(1)}
+        data-rescue-count={rescueCount}
+        data-game-mode={gameMode}
+        data-movement-locked={isPaused || activeDialog || showHeroModal || chapterWon || chapterOutcome ? 'true' : 'false'}
+        onPointerDown={() => canvasRef.current?.focus()}
         style={{ imageRendering: 'pixelated' }}
       />
 
@@ -1439,12 +2471,38 @@ export function ExplorableWorld({
       {nearbyInteraction && !activeDialog && (
         <div className="world-interaction-prompt">
           <div className="prompt-bubble">
-            <span className="prompt-key">E</span>
+            <span className={`prompt-key ${interactionRequiresHold ? 'prompt-key-hold' : ''}`}>E</span>
             <div className="prompt-content">
               <span className="prompt-label">{nearbyInteraction.label}</span>
-              <button className="prompt-action-btn" onClick={handleInteract}>
-                {nearbyInteraction.actionText} ↗
+              <button
+                className={`prompt-action-btn ${interactionRequiresHold ? 'hold-interaction-btn' : ''}`}
+                onClick={handleInteractionClick}
+                onPointerDown={handleHoldPointerDown}
+                onPointerUp={handleHoldPointerUp}
+                onPointerCancel={handleHoldPointerCancel}
+                onPointerLeave={interactionRequiresHold ? handleHoldPointerCancel : undefined}
+                data-hold-interaction={interactionRequiresHold ? 'true' : 'false'}
+                data-hold-progress={interactionProgress.toFixed(2)}
+                aria-label={interactionRequiresHold ? `${nearbyInteraction.actionText}; basılı tut` : nearbyInteraction.actionText}
+              >
+                {nearbyInteraction.actionText} {interactionRequiresHold ? '· BASILI TUT' : '↗'}
               </button>
+              {interactionRequiresHold && (
+                <div className="interaction-hold-feedback" aria-live="polite">
+                  <div className="interaction-hold-track">
+                    <span style={{ width: `${Math.round(interactionProgress * 100)}%` }} />
+                  </div>
+                  <span>{interactionProgress > 0 ? `${Math.round(interactionProgress * 100)}%` : 'E basılı tut'}</span>
+                </div>
+              )}
+              {nearbyDefense && nearbyDefenseGuidance && (
+                <div className="defense-feedback-card" data-defense-feedback={nearbyDefense.id}>
+                  <strong>{nearbyDefense.name} · {nearbyDefense.cost} Kr</strong>
+                  <span><b>Etki:</b> {nearbyDefenseGuidance.effect}</span>
+                  <span><b>Alan:</b> {nearbyDefenseGuidance.effective}</span>
+                  <span><b>Sınır:</b> {nearbyDefenseGuidance.limit}</span>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -1473,15 +2531,15 @@ export function ExplorableWorld({
       {activeDialog && (
         <div className="world-dialog-modal">
           <div className="dialog-header">
-            <div className={`dialog-avatar-box avatar-${activeDialog.speaker.toLowerCase()}`}>
+            <div className={`dialog-avatar-box avatar-${getSpeakerAssetKey(activeDialog.speaker)}`}>
               <img
-                src={`/assets/characters/${activeDialog.speaker.toLowerCase()}-portrait.png`}
+                src={`/assets/characters/${getSpeakerAssetKey(activeDialog.speaker)}-portrait.png`}
                 alt={activeDialog.speaker}
                 className="dialog-avatar-img"
               />
             </div>
             <div>
-              <span className={`dialog-speaker speaker-${activeDialog.speaker.toLowerCase()}`}>
+              <span className={`dialog-speaker speaker-${getSpeakerAssetKey(activeDialog.speaker)}`}>
                 {activeDialog.speaker}
               </span>
               <h4>{activeDialog.title}</h4>
@@ -1513,6 +2571,7 @@ export function ExplorableWorld({
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchEnd}
       >
         <div className="joystick-base">
           <div
@@ -1527,34 +2586,52 @@ export function ExplorableWorld({
       <div className="mobile-action-zone">
         <button
           className={`mobile-interact-btn ${nearbyInteraction ? 'btn-active' : ''}`}
-          onClick={handleInteract}
+          onClick={handleInteractionClick}
+          onPointerDown={handleHoldPointerDown}
+          onPointerUp={handleHoldPointerUp}
+          onPointerCancel={handleHoldPointerCancel}
+          onPointerLeave={interactionRequiresHold ? handleHoldPointerCancel : undefined}
+          data-hold-interaction={interactionRequiresHold ? 'true' : 'false'}
+          data-hold-progress={interactionProgress.toFixed(2)}
         >
           <span>E</span>
-          <small>{nearbyInteraction ? 'ETKİLEŞ' : 'HAREKET'}</small>
+          <small>{nearbyInteraction ? (interactionRequiresHold ? 'BASILI TUT' : 'ETKİLEŞ') : 'HAREKET'}</small>
         </button>
       </div>
 
       {/* 10. Gelişmiş Taktik Radar & Yol Haritası */}
-      <div className="world-minimap-card">
+      <div className={`world-minimap-card ${showMinimap ? 'minimap-expanded' : 'minimap-collapsed'}`}>
         <div className="minimap-header">
-          <Compass size={11} /> RADAR • SEKTÖR 04
+          <span><Compass size={11} /> RADAR • SEKTÖR 04</span>
+          <button
+            className="minimap-toggle-btn"
+            onClick={() => setShowMinimap((visible) => !visible)}
+            aria-expanded={showMinimap}
+            aria-label={showMinimap ? 'Radarı küçült' : 'Radarı aç'}
+          >
+            {showMinimap ? '−' : '+'}
+          </button>
         </div>
-        <div className="minimap-body">
-          <canvas
-            ref={radarCanvasRef}
-            width={138}
-            height={80}
-            className="radar-canvas-view"
-          />
-        </div>
-        <div className="radar-legend-bar">
-          <span className="radar-legend-item">
-            <i className="radar-dot-sample sample-route" /> Rota
-          </span>
-          <span className="radar-legend-item">
-            <i className="radar-dot-sample sample-flood" /> Taşkın
-          </span>
-        </div>
+        {showMinimap && (
+          <>
+            <div className="minimap-body">
+              <canvas
+                ref={radarCanvasRef}
+                width={138}
+                height={80}
+                className="radar-canvas-view"
+              />
+            </div>
+            <div className="radar-legend-bar">
+              <span className="radar-legend-item">
+                <i className="radar-dot-sample sample-target" /> Hedef
+              </span>
+              <span className="radar-legend-item">
+                <i className="radar-dot-sample sample-flood" /> Taşkın
+              </span>
+            </div>
+          </>
+        )}
       </div>
 
       {/* 11. Karakter Seçim Modalı (Hero Select) */}
@@ -1624,55 +2701,96 @@ export function ExplorableWorld({
         </div>
       )}
 
-      {/* 12. Bölüm 1 Zafer Modalı */}
-      {chapterWon && (
-        <div className="chapter-victory-modal">
-          <div className="chapter-victory-card">
-            <div className="victory-badge-icon">🏆</div>
-            <span className="quest-chapter-tag" style={{ alignSelf: 'center' }}>
-              BÖLÜM 1 TAMAMLANDI
-            </span>
-            <h2 style={{ margin: '4px 0', fontSize: '22px', color: '#4ade80' }}>
-              YAMAÇ HASTANESİ KURTARILDI!
-            </h2>
-            <p style={{ margin: 0, fontSize: '13px', color: '#cbd5e1', lineHeight: 1.5 }}>
-              Tebrikler <strong>{HEROES[heroType].name}</strong>! Kurduğun doğa tabanlı sünger gölet altyapısı sayesinde 88 mm/saatlik sel felaketi engellendi. Hastane acil servis yolu açık tutuldu.
-            </p>
-            <div className="victory-stats-grid">
-              <div className="victory-stat-item">
-                <small>HASTANE YOLU DURUMU</small>
-                <strong>✓ AÇIK (GÜVENLİ)</strong>
-              </div>
-              <div className="victory-stat-item">
-                <small>YOL SU DERİNLİĞİ</small>
-                <strong>{spatialState.hospitalRoadWaterDepth} cm (&lt;30 cm)</strong>
-              </div>
-              <div className="victory-stat-item">
-                <small>KALAN KAMU BÜTÇESİ</small>
-                <strong>{BUDGET - budgetUsed} / 100 Kr</strong>
-              </div>
-              <div className="victory-stat-item">
-                <small>KURULAN SAVUNMALAR</small>
-                <strong>{activeDefenses.length} Sistem Aktif</strong>
-              </div>
-            </div>
-            <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
-              <button
-                className="secondary-button"
-                style={{ flex: 1, padding: '10px' }}
-                onClick={() => setChapterWon(false)}
-              >
-                Şehri Serbestçe Gez
-              </button>
-              <button
-                className="primary-button"
-                style={{ flex: 1, padding: '10px' }}
-                onClick={onBackToMenu}
-              >
-                Ana Menüye Dön ↗
-              </button>
-            </div>
+      {achievementNotice && !activeDialog && (
+        <div className="achievement-unlock-toast" role="status">
+          <img src={getAchievementAsset(achievementNotice)} alt="" />
+          <div><small>ROZET KAZANILDI</small><strong>{ACHIEVEMENTS.find((achievement) => achievement.id === achievementNotice)?.title}</strong></div>
+          <button aria-label="Rozet bildirimini kapat" onClick={() => setAchievementNotice(null)}>×</button>
+        </div>
+      )}
+
+      {isPaused && !chapterOutcome && (
+        <div className="world-pause-overlay" role="dialog" aria-label="Oyun duraklatıldı">
+          <div className="world-pause-card">
+            <BrandLogo variant="compact" className="pause-brand-logo" />
+            <div className="chapter-result-kicker">ŞEHRİN YARINI · DURAKLATILDI</div>
+            <h2>Bir nefes al.</h2>
+            <p>Fırtına simülasyonu, macera süresi ve kontroller beklemede.</p>
+            <button className="primary-button" onClick={() => setIsPaused(false)}>OYUNA DÖN</button>
+            <button className="text-button" onClick={onBackToMenu}>BÖLÜM MENÜSÜ</button>
           </div>
+        </div>
+      )}
+
+      {chapterOutcome && outcomePresentation && (
+        <div className={`chapter-result-modal ${chapterOutcome.success ? 'result-success' : 'result-failure'} ${endingVisible ? 'ending-modal' : 'result-modal-ready'}`}>
+          {endingVisible ? (
+            <div className={`chapter-result-card ending-sequence-card ending-${outcomePresentation.tone}`} data-chapter-outcome={chapterOutcome.success ? 'success' : 'failure'}>
+              <div
+                className={`ending-scene-strip ending-road-${spatialState.hospitalRoadPassable ? 'open' : 'closed'}`}
+                data-ending-tone={outcomePresentation.tone}
+                data-road-state={spatialState.hospitalRoadPassable ? 'open' : 'closed'}
+                data-water-depth={spatialState.hospitalRoadWaterDepth.toFixed(1)}
+              >
+                <span className="ending-sun" />
+                <span className="ending-mountain ending-mountain-a" />
+                <span className="ending-mountain ending-mountain-b" />
+                <span className="ending-road"><i style={{ width: `${Math.min(100, Math.max(4, spatialState.hospitalRoadWaterDepth * 2.2))}%` }} /></span>
+                <span className="ending-hospital-cross">+</span>
+                <span className="ending-ambulance" aria-label={spatialState.hospitalRoadPassable ? 'Ambulans geçişi açık' : 'Ambulans geçişi kapalı'}>✚</span>
+                <span className="ending-recorded-badge">GERÇEK SİMÜLASYON KAYDI</span>
+              </div>
+              <BrandLogo variant="compact" className="result-brand-logo" />
+              <div className="chapter-result-kicker">BÖLÜM 1 · GERÇEK OYUN SONUCU</div>
+              <h2>{outcomePresentation.title}</h2>
+              <p>{outcomePresentation.subtitle}</p>
+              <div className="ending-state-note"><Sparkles size={14} /><span>{outcomePresentation.detail}</span></div>
+              <div className="ending-real-state">
+                <span>HASTANE YOLU: <b>{spatialState.hospitalRoadPassable ? 'AÇIK' : 'KAPALI'}</b></span>
+                <span>SU: <b>{spatialState.hospitalRoadWaterDepth} cm</b></span>
+                <span>HAVA: <b>{weatherPhaseLabel(weather.phase)}</b></span>
+              </div>
+              <button className="text-button ending-skip-button" onClick={skipEnding}>SONUCU GÖR <ArrowLeft size={13} /></button>
+            </div>
+          ) : (
+            <div className="chapter-result-card" data-chapter-outcome={chapterOutcome.success ? 'success' : 'failure'}>
+              <BrandLogo variant="compact" className="result-brand-logo" />
+              <div className="chapter-result-kicker">BÖLÜM 1 · YAMAÇ HASTANESİ</div>
+              <div className="chapter-result-icon">{chapterOutcome.success ? '✦' : '!'}</div>
+              <h2>{outcomePresentation.title}</h2>
+              <p>{chapterOutcome.success ? chapterOutcome.reason : 'Bu kez şehri koruyamadık. Ama yeniden deneyebilirsin!'}</p>
+              <div className="result-stars" aria-label={`${chapterOutcome.stars} yıldız`}>
+                {[1, 2, 3].map((star) => <span key={star}><img src={star <= chapterOutcome.stars ? BRAND_ASSETS.stars.earned : BRAND_ASSETS.stars.empty} className={star <= chapterOutcome.stars ? 'earned' : ''} alt={star <= chapterOutcome.stars ? 'Kazanılmış yıldız' : 'Boş yıldız'} /><span className="star-readable">★</span></span>)}
+              </div>
+              <div className="chapter-result-grid">
+                <span>HASTANE YOLU <b>{spatialState.hospitalRoadPassable ? 'AÇIK' : 'KAPALI'}</b></span>
+                <span>SU DERİNLİĞİ <b>{spatialState.hospitalRoadWaterDepth} cm</b></span>
+                <span>KALAN BÜTÇE <b>{BUDGET - budgetUsed} Kr</b></span>
+                <span>RESCUE <b>{rescueCount}</b></span>
+                {gameMode === 'adventure' && <span>SÜRE <b>{Math.floor(stormElapsedSeconds)} sn</b></span>}
+                <span>EN İYİ <b>{chapterRecord?.bestStars ?? chapterOutcome.stars} ★</b></span>
+              </div>
+              <div className="chapter-comparison-reveal" aria-label="Gerçek simülasyon öncesi sonrası karşılaştırması">
+                <div className="chapter-comparison-heading">AYNI HASTANE YOLU · GERÇEK SİMÜLASYON KAYDI</div>
+                <div className="chapter-comparison-bars">
+                  <div><span>MÜDAHALE ÖNCESİ <b>{recordedPeakWater.toFixed(1)} cm</b></span><i style={{ width: `${Math.min(100, (recordedPeakWater / comparisonScale) * 100)}%` }} /></div>
+                  <div><span>MÜDAHALE SONRASI <b>{recordedCurrentWater.toFixed(1)} cm</b></span><i className="after" style={{ width: `${Math.min(100, (recordedCurrentWater / comparisonScale) * 100)}%` }} /></div>
+                </div>
+              </div>
+              {endingNewBadges.length > 0 && (
+                <div className="result-new-badges">
+                  <small>BU OYUNDA KAZANILAN ROZETLER</small>
+                  <div>{endingNewBadges.map((id) => { const badge = ACHIEVEMENTS.find((item) => item.id === id); return badge ? <span key={id}><img src={getAchievementAsset(id)} alt="" />{badge.title}</span> : null; })}</div>
+                </div>
+              )}
+              <div className="chapter-result-actions">
+                <button className="primary-button" onClick={handleResetQuest}>YENİDEN DENE ↻</button>
+                <button className="secondary-button" onClick={onBackToMenu}>BÖLÜM MENÜSÜ</button>
+                {!chapterOutcome.success && <button className="text-button" onClick={() => { setChapterOutcome(null); setShowEkoHint(true); }}>İPUCU AL</button>}
+                {chapterOutcome.success && <button className="secondary-button" onClick={() => { setChapterOutcome(null); setChapterWon(false); }}>ŞEHRİ GEZ</button>}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

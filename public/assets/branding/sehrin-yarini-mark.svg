@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">Şehrin Yarını şehir markası</title>
+  <rect width="128" height="128" rx="24" fill="#163b42"/>
+  <circle cx="64" cy="64" r="45" fill="#f4bd4f" stroke="#70402c" stroke-width="6"/>
+  <path d="M64 88c-16-22-33-31-30-45 3-13 17-17 29-7 12-10 26-6 29 7 3 14-14 23-28 45z" fill="#58a662" stroke="#2d5c3d" stroke-width="5"/>
+  <path d="M64 41v40M49 63h30" stroke="#f9e9aa" stroke-width="5"/>
+  <path d="M25 101h78" stroke="#f9e9aa" stroke-width="5"/>
+</svg>

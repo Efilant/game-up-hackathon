@@ -97,7 +97,7 @@ export function CityScene({
       <svg
         viewBox="0 0 960 580"
         role="img"
-        aria-label="FELAKET BENİM — Yaşayan izometrik şehir simülasyonu"
+        aria-label="ŞEHRİN YARINI — Yaşayan izometrik şehir simülasyonu"
         className="city-viewport-svg"
       >
         <defs>
@@ -657,7 +657,7 @@ export function CityScene({
           );
         })}
 
-        {/* 4. INTERACTIVE DEFENSE PLACEMENT SLOTS (Only in Planning/Strategy Mode) */}
+        {/* 4. INTERACTIVE DEFENSE PLACEMENT SLOTS */}
         {isPlanningMode && onToggleDefense && (
           <g className="interactive-placement-layer">
             {/* Slot 1: Sünger Kent (Yamaç Sırtı Havzası) */}

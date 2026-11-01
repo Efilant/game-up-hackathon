@@ -1,0 +1,21 @@
+ M e2e/world-visual.spec.ts
+ M src/ExplorableWorld.tsx
+ M src/ambientCitizens.ts
+ M src/audio.ts
+ M src/cinema.css
+ M src/navigation.test.ts
+ M src/navigation.ts
+ M src/pixelWorldRenderer.ts
+ M src/spatialSimulation.ts
+ M test-results/.last-run.json
+ D test-results/world-visual-Capture-real--c7a86-n-golden-trail-EKO-guidance-desktop-motion/error-context.md
+ D test-results/world-visual-Capture-real--c7a86-n-golden-trail-EKO-guidance-desktop/error-context.md
+ D test-results/world-visual-Capture-real--c7a86-n-golden-trail-EKO-guidance-mobile/error-context.md
+ M tsconfig.tsbuildinfo
+?? audit/
+?? e2e/player-movement.spec.ts
+?? e2e/weather-flood.spec.ts
+?? src/playerMovement.test.ts
+?? src/playerMovement.ts
+?? src/weather.test.ts
+?? src/weather.ts

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { startNewRpgGame } from './helpers';
 
 test('Gerçek ses sinyali, bağımsız kanallar ve sessize alma', async ({ page }) => {
   await page.addInitScript(() => {
@@ -43,7 +44,7 @@ test('Ses API yokken oyun başlatılabilir',async({page})=>{
   const errors: string[]=[]; page.on('pageerror',e=>errors.push(e.message));
   await page.addInitScript(()=>{(window as any).AudioContext=undefined;(window as any).webkitAudioContext=undefined});
   await page.goto('/');
-  await page.getByRole('button',{name:'BAŞLAT ↗',exact:true}).click();
-  await expect(page.getByRole('button',{name:'Devam et'})).toBeVisible();
+  await startNewRpgGame(page);
+  await expect(page.locator('.world-canvas')).toBeVisible();
   expect(errors).toEqual([]);
 });

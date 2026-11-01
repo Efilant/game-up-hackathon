@@ -1,64 +1,20 @@
 import { expect, test } from '@playwright/test';
-test('Tam oyun, gerçek tıklamalar, varlıklar, bütçe ve ses',async({page},testInfo)=>{
-  const errors:string[]=[];
-  page.on('pageerror',e=>errors.push(e.message));
-  page.on('console',m=>{if(m.type()==='error')errors.push(m.text())});
-  await page.addInitScript(()=>{
-    (window as any).__notes=[];
-    const start=OscillatorNode.prototype.start;
-    OscillatorNode.prototype.start=function(when?:number){(window as any).__notes.push(this.frequency.value);return start.call(this,when)};
-  });
+import { startNewRpgGame } from './helpers';
+
+test('tek girişli RPG akışı menüden şehre ve gerçek etkileşime ulaşır', async ({ page }) => {
+  const errors: string[] = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  page.on('console', (message) => { if (message.type() === 'error') errors.push(message.text()); });
+  await page.addInitScript(() => localStorage.clear());
   await page.goto('/');
-  const motif=async(note:number)=>expect.poll(()=>page.evaluate((n)=>((window as any).__notes as number[]).some(f=>Math.abs(f-440*2**((n-69)/12))<.01),note)).toBe(true);
-  const resetNotes=()=>page.evaluate(()=>{(window as any).__notes=[]});
-  const shot=async(name:string)=>{await expect(page.locator('.chapter-curtain')).not.toBeVisible();return page.screenshot({path:`artifacts/${name}-${testInfo.project.name}.png`,fullPage:true,animations:'disabled'})};
-  const noOverflow=async()=>expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
-  await expect(page.getByRole('heading',{name:'FELAKET BENİM.'})).toBeVisible();
-  await noOverflow(); await shot('menu');
-  await page.getByRole('button',{name:'AYARLAR',exact:true}).click();
-  await motif(48);
-  await page.getByRole('slider',{name:'Müzik seviyesi'}).fill('0');
-  await page.getByRole('slider',{name:'Efekt seviyesi'}).fill('0');
-  await page.getByRole('button',{name:'TÜMÜNÜ SUSTUR'}).click();
-  await expect(page.getByRole('button',{name:'Sesi aç',exact:true})).toBeVisible();
-  await page.getByRole('slider',{name:'Müzik seviyesi'}).fill('40');
-  await page.getByRole('slider',{name:'Efekt seviyesi'}).fill('30');
-  await page.getByRole('button',{name:'SESSİZİ KALDIR'}).click();
-  await page.getByRole('button',{name:'Ses ayarlarını aç'}).click();
-  await page.getByRole('button',{name:'HAKKINDA',exact:true}).click();
-  await page.getByRole('button',{name:'MENÜYE DÖN'}).click();
-  await resetNotes(); await page.getByRole('button',{name:'BAŞLAT ↗',exact:true}).click();
-  await motif(45);
-  for(let i=0;i<4;i++){
-    await expect(page.locator('.portrait img')).toBeVisible();
-    await expect.poll(()=>page.locator('.portrait img').evaluate((img:HTMLImageElement)=>img.naturalWidth)).toBeGreaterThan(0);
-    if(i===1)await shot('story');
-    await noOverflow(); await page.getByRole('button',{name:'Devam et'}).click();
-  }
-  await page.getByRole('button',{name:'Eski Merkez',exact:true}).click();
-  await motif(42);
-  await expect(page.locator('.district-intel')).toContainText('Eski Merkez');
-  await noOverflow(); await shot('stress');
-  await page.getByRole('button',{name:'SONUCU KAYDET'}).click();
-  for(let i=0;i<3;i++)await page.getByRole('button',{name:'Devam et'}).click();
-  await motif(50);
-  await expect(page.getByRole('button',{name:'PLANI UYGULA'})).toBeDisabled();
-  await page.getByRole('button',{name:/Erken Uyarı Ağı/}).click();
-  await page.getByRole('button',{name:/Sünger Kent/}).click();
-  await page.getByRole('button',{name:/Kıyı Seti/}).click();
-  await expect(page.getByRole('button',{name:/Güvenli Dönüşüm/})).toBeDisabled();
-  await expect(page.locator('.signal-tower')).toHaveCount(4);
-  await noOverflow();await shot('plan');
-  await page.getByRole('button',{name:'PLANI UYGULA'}).click();
-  await expect(page.getByRole('button',{name:/ŞEHRİN HAFIZASINI AÇ/})).toBeEnabled({timeout:5000});
-  await shot('replay');
-  await resetNotes(); await page.getByRole('button',{name:/ŞEHRİN HAFIZASINI AÇ/}).click();
-  await motif(53);
-  await expect(page.locator('.memory-pair')).toBeVisible();
-  const damage=await page.locator('.memory-pair .flood-surface').evaluateAll(els=>els.map(el=>Number(el.getAttribute('data-damage'))));
-  expect(damage[4]).toBeLessThan(damage[0]);
-  await noOverflow();await shot('final');
-  await page.getByRole('button',{name:'YENİDEN OYNA'}).click();
-  await expect(page.getByRole('button',{name:'Devam et'})).toBeVisible();
+
+  await expect(page.getByRole('button', { name: 'YENİ OYUN ↗' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /ŞEHRE İN/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /TAKTİK HARİTA/ })).toHaveCount(0);
+
+  const canvas = await startNewRpgGame(page);
+  await expect(canvas).toHaveAttribute('data-current-district', 'merkez');
+  await expect(page.getByRole('button', { name: /TAKTİK HARİTA/ })).toHaveCount(0);
+  await expect(page.locator('.rpg-compass')).toBeVisible();
   expect(errors).toEqual([]);
 });

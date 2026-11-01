@@ -1,0 +1,11 @@
+ŞEHRİN YARINI — GAMEPLAY FEEDBACK FINAL QA
+Tarih: 2026-11-01
+
+lint: PASS
+unit: 11 test files / 50 tests PASS
+production build: PASS
+full browser E2E: 54 total / 50 PASS / 4 expected SKIP / 0 FAIL
+profiles: desktop, mobile (390x844), desktop-motion
+validated: keyboard movement, mobile joystick, keyboard hold cancel/complete, mobile hold, female flow, male flow, 0/1/2/3 star outcomes, weather, flood, Sponge City measurement, four districts, visual/branding smoke
+expected skips: mobile pointer interaction on desktop and desktop-motion; mobile joystick on desktop and desktop-motion
+unmeasured: formal FPS benchmark, recorded 90-second jury video

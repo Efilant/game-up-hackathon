@@ -8,6 +8,13 @@
 
 import { type DefenseId, type DistrictId } from './simulation';
 
+export const FIXED_SIMULATION_STEP_SECONDS = 0.15;
+export const STORM_DURATION_TICKS = 30;
+export const SPONGE_STORAGE_CAPACITY_CM = 32;
+export const SPONGE_CAPTURE_RATE_CM_PER_TICK = 4;
+export const SPONGE_RELEASE_RATE_CM_PER_TICK = 0.8;
+const SPONGE_CATCHMENT_CELL = 'yamac_zirve';
+
 export type CriticalInfrastructureId = 
   | 'hastane'
   | 'hastane_yolu'
@@ -38,6 +45,17 @@ export interface SimulationEvent {
   description: string;
 }
 
+export interface SpatialSimulationMetrics {
+  cumulativeRainInput: number;
+  cumulativeInfiltration: number;
+  cumulativeDrainage: number;
+  cumulativeOutflow: number;
+  spongeCapturedWater: number;
+  spongePeakStorage: number;
+  peakHospitalRoadWaterDepth: number;
+  timeAboveRoadThreshold: number;
+}
+
 export interface SpatialSimulationState {
   tick: number;
   maxTicks: number;
@@ -52,6 +70,12 @@ export interface SpatialSimulationState {
   speed: 1 | 2;
   selectedDefenses: DefenseId[];
   isCompleted: boolean;
+  spongeStorage: number;
+  spongeStorageCapacity: number;
+  spongeDeploymentTicksRemaining: number;
+  spongeOperational: boolean;
+  roadWetness: number;
+  metrics: SpatialSimulationMetrics;
 }
 
 // Hücre şablonları: 4 bölge ve kritik arterler
@@ -76,7 +100,7 @@ export function createInitialCells(): Record<string, SpatialCell> {
       districtId: 'yamaç',
       elevation: 7,
       basePermeability: 0.10, // asfalt
-      drainageRate: 2.0,      // düşük drenaj
+      drainageRate: 0.05,     // düşük drenaj; asfalt yolun kritik çukuru
       waterDepth: 0,
       maxRetention: 5,
       isRoad: true,
@@ -195,7 +219,7 @@ export function createInitialCells(): Record<string, SpatialCell> {
 export function createInitialSpatialState(selectedDefenses: DefenseId[] = []): SpatialSimulationState {
   return {
     tick: 0,
-    maxTicks: 30, // 30 adımlık fırtına döngüsü
+    maxTicks: 80, // 30 tick fırtına + 50 tick toparlanma
     timeString: '14:00',
     rainfallRate: 88, // mm/h
     cells: createInitialCells(),
@@ -208,15 +232,38 @@ export function createInitialSpatialState(selectedDefenses: DefenseId[] = []): S
         tick: 0,
         timeString: '14:00',
         type: 'info',
-        title: 'Fırtına Başladı',
-        description: '88 mm/saat yoğun yağış kentin üzerine düşüyor. Drenaj sistemleri izleniyor.',
+        title: 'Yağış Sensörleri Beklemede',
+        description: 'Fırtına gözlem noktasında başlatılacak. Drenaj ve hastane yolu hazır durumda.',
       },
     ],
     isPlaying: true,
     speed: 1,
     selectedDefenses,
     isCompleted: false,
+    spongeStorage: 0,
+    spongeStorageCapacity: SPONGE_STORAGE_CAPACITY_CM,
+    spongeDeploymentTicksRemaining: 0,
+    spongeOperational: selectedDefenses.includes('sünger'),
+    roadWetness: 0,
+    metrics: {
+      cumulativeRainInput: 0,
+      cumulativeInfiltration: 0,
+      cumulativeDrainage: 0,
+      cumulativeOutflow: 0,
+      spongeCapturedWater: 0,
+      spongePeakStorage: 0,
+      peakHospitalRoadWaterDepth: 0,
+      timeAboveRoadThreshold: 0,
+    },
   };
+}
+
+export interface SpatialScenarioComparison {
+  baseline: SpatialSimulationState;
+  intervention: SpatialSimulationState;
+  peakDepthDifference: number;
+  timeAboveThresholdDifference: number;
+  finalDepthDifference: number;
 }
 
 /**
@@ -238,13 +285,47 @@ export function stepSpatialSimulation(
   const timeString = `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
 
   const has = (id: DefenseId) => selectedDefenses.includes(id);
+  const newlyDeployedSponge = has('sünger') && !prev.selectedDefenses.includes('sünger');
+  const spongeDeploymentTicksRemaining = newlyDeployedSponge
+    ? 3
+    : has('sünger')
+      ? Math.max(0, prev.spongeDeploymentTicksRemaining - 1)
+      : 0;
+  const spongeOperational = has('sünger') && (
+    prev.spongeOperational || (!newlyDeployedSponge && spongeDeploymentTicksRemaining === 0)
+  );
 
-  // Yağmur şiddeti eğrisi: fırtına ortasında (tick 10-20) zirve yapar
-  const stormIntensity = Math.sin((nextTick / prev.maxTicks) * Math.PI);
-  const rainInput = (prev.rainfallRate / 20) * (0.6 + stormIntensity * 0.8); // cm yağış
+  // Yağmur şiddeti eğrisi: ilk 30 tick fırtına, sonrasında yağış kesilir ve
+  // yalnızca drenaj/infiltrasyonun görünür olduğu toparlanma penceresi başlar.
+  const stormProgress = Math.min(1, nextTick / STORM_DURATION_TICKS);
+  const stormIntensity = nextTick <= STORM_DURATION_TICKS ? Math.sin(stormProgress * Math.PI) : 0;
+  const recoveryRainFactor = nextTick > STORM_DURATION_TICKS
+    ? Math.max(0, 0.18 * (1 - (nextTick - STORM_DURATION_TICKS) / 12))
+    : 0;
+  const rainInput = (prev.rainfallRate / 16) * (
+    nextTick <= STORM_DURATION_TICKS ? 0.6 + stormIntensity * 0.8 : recoveryRainFactor
+  ); // cm yağış / hücre / tick
 
   const updatedCells: Record<string, SpatialCell> = {};
   const newEvents = [...prev.events];
+  let infiltrationTotal = 0;
+  let drainageTotal = 0;
+  let spongeStorage = has('sünger') ? prev.spongeStorage : 0;
+  let spongeCapturedWater = prev.metrics.spongeCapturedWater;
+  // Chapter 1 models the build as a temporary emergency diversion, not a
+  // permanent city-wide retrofit. A small amount of already-standing water
+  // is routed into the basin while the three-tick installation completes.
+  if (newlyDeployedSponge) {
+    const catchmentWater = prev.cells[SPONGE_CATCHMENT_CELL].waterDepth + prev.hospitalRoadWaterDepth * 0.12;
+    const deploymentCapture = Math.min(catchmentWater * 0.12, SPONGE_CAPTURE_RATE_CM_PER_TICK, SPONGE_STORAGE_CAPACITY_CM);
+    spongeStorage = deploymentCapture;
+    spongeCapturedWater += deploymentCapture;
+  }
+  const spongeRelease = spongeOperational
+    ? Math.min(spongeStorage, SPONGE_RELEASE_RATE_CM_PER_TICK)
+    : 0;
+  spongeStorage -= spongeRelease;
+  infiltrationTotal += spongeRelease;
 
   // 1. Hücre bazlı su girişi, geçirgenlik ve drenaj
   for (const [id, cell] of Object.entries(prev.cells)) {
@@ -252,10 +333,18 @@ export function stepSpatialSimulation(
     let effectiveDrainage = cell.drainageRate;
 
     // Savunma etkileri:
-    // SÜNGER KENT: Doğal su tutma ve geçirgenlik artışı
-    if (has('sünger')) {
-      effectivePermeability += 0.35;
-      effectiveDrainage += 2.2;
+    // SÜNGER KENT yalnızca bağlı olduğu yamaç havzasında çalışır. Bu,
+    // müdahalenin tüm şehri sihirli biçimde kurutmasını engeller.
+    if (spongeOperational && id === SPONGE_CATCHMENT_CELL) {
+      effectivePermeability = Math.min(0.9, effectivePermeability + 0.45);
+      effectiveDrainage += 2;
+    }
+    if (spongeOperational && id === 'yamac_hastane_yolu') {
+      // Sünger kent yalnızca üst havzayı değil, bağlı hastane koridorunun
+      // geçirgen omuzlarını da devreye alır; bu, hazırlık önceden yapıldıysa
+      // yolun kritik eşiğe hiç çıkmamasını sağlar.
+      effectivePermeability = Math.min(0.32, effectivePermeability + 0.12);
+      effectiveDrainage += 2.4;
     }
 
     // GÜVENLİ DÖNÜŞÜM: Yapı ve kritik yollarda yükseltilmiş bariyer ve drenaj
@@ -268,10 +357,42 @@ export function stepSpatialSimulation(
       effectiveDrainage += 2.5;
     }
 
-    // Net su artışı
-    const netRain = Math.max(0, rainInput * (1 - effectivePermeability));
-    let newWater = cell.waterDepth + netRain - effectiveDrainage * 0.45;
+    const rainfallInfiltration = Math.min(rainInput, rainInput * effectivePermeability);
+    let netRain = Math.max(0, rainInput - rainfallInfiltration);
+    infiltrationTotal += rainfallInfiltration;
+
+    // Retention basin: finite capacity, gradual release. It captures only
+    // runoff generated in the hydraulically connected catchment.
+    if (spongeOperational && id === SPONGE_CATCHMENT_CELL) {
+      const availableCapacity = Math.max(0, SPONGE_STORAGE_CAPACITY_CM - spongeStorage);
+      const captured = Math.min(
+        netRain * 0.7,
+        SPONGE_CAPTURE_RATE_CM_PER_TICK,
+        availableCapacity,
+      );
+      spongeStorage += captured;
+      spongeCapturedWater += captured;
+      netRain -= captured;
+    }
+
+    // Drainage removes existing standing water and this tick's runoff, but
+    // never more than the water physically present in the cell.
+    const drainage = Math.min(cell.waterDepth + netRain, effectiveDrainage * 0.45);
+    drainageTotal += drainage;
+    let newWater = cell.waterDepth + netRain - drainage;
     newWater = Math.max(0, newWater);
+
+    // Active intervention can also draw down already-standing water in its
+    // connected catchment, but only gradually and only while capacity remains.
+    // This is the emergency-deployment behavior used by Chapter 1; it is not
+    // an instant zeroing of the flood.
+    if (spongeOperational && id === SPONGE_CATCHMENT_CELL) {
+      const availableCapacity = Math.max(0, SPONGE_STORAGE_CAPACITY_CM - spongeStorage);
+      const standingWaterCapture = Math.min(newWater * 0.28, 1.8, availableCapacity);
+      spongeStorage += standingWaterCapture;
+      spongeCapturedWater += standingWaterCapture;
+      newWater -= standingWaterCapture;
+    }
 
     updatedCells[id] = {
       ...cell,
@@ -279,53 +400,52 @@ export function stepSpatialSimulation(
     };
   }
 
-  // 2. Yüzey Akışı Transferi: Yüksek kottan alçak kota su akışı
   const runoffCells = { ...updatedCells };
+  let externalOutflow = 0;
+  // 3. Yüzey suyu transferi ve model dışına çıkan akış
+  // Transferler aynı tick içinde hücreler arasında korunur; yalnızca denize
+  // veya ağ dışına çıkan su externalOutflow olarak kaydedilir.
   for (const [id, cell] of Object.entries(updatedCells)) {
-    if (cell.waterDepth > 3 && cell.connectedTo.length > 0) {
-      const outflow = cell.waterDepth * 0.28; // %28 eğim transferi
-      runoffCells[id].waterDepth = Math.max(0, Math.round((cell.waterDepth - outflow) * 10) / 10);
-
-      // Suyu komşulara paylaştır (eğer komşunun kotu daha düşükse)
-      const validTargets = cell.connectedTo.filter(
-        (targetId) => updatedCells[targetId].elevation < cell.elevation
-      );
-      if (validTargets.length > 0) {
-        const share = outflow / validTargets.length;
-        for (const targetId of validTargets) {
-          // Kıyı seti varsa kıyı rıhtımına denizden dalga ve taşkın taşması kısıtlanır
-          let inflowFactor = 1.0;
-          if (has('set') && targetId === 'kiyi_rihtim') {
-            inflowFactor = 0.42;
-          }
-          runoffCells[targetId].waterDepth = Math.round(
-            (runoffCells[targetId].waterDepth + share * inflowFactor) * 10
-          ) / 10;
-        }
-      }
+    if (cell.waterDepth <= 3) continue;
+    const outflow = Math.min(cell.waterDepth, cell.waterDepth * 0.28);
+    const validTargets = cell.connectedTo.filter(
+      (targetId) => updatedCells[targetId].elevation < cell.elevation
+    );
+    runoffCells[id].waterDepth = Math.max(0, Math.round((cell.waterDepth - outflow) * 10) / 10);
+    if (validTargets.length === 0) {
+      externalOutflow += outflow;
+      continue;
+    }
+    const share = outflow / validTargets.length;
+    for (const targetId of validTargets) {
+      let inflowFactor = 1.0;
+      if (has('set') && targetId === 'kiyi_rihtim') inflowFactor = 0.42;
+      runoffCells[targetId].waterDepth = Math.round(
+        (runoffCells[targetId].waterDepth + share * inflowFactor) * 10
+      ) / 10;
+      if (inflowFactor < 1) externalOutflow += share * (1 - inflowFactor);
     }
   }
 
-  // 3. Kritik Hastane Yolu Durumu
+  // 4. Kritik Hastane Yolu Durumu — artık hard-coded 18.5 cm sınırı yok;
+  // tek kaynak, hücrenin hesaplanan su derinliğidir.
   const hospitalRoadCell = runoffCells['yamac_hastane_yolu'];
-  let roadDepth = hospitalRoadCell.waterDepth;
-
-  // Savunma yoksa yamaç eğiminden gelen su çukurda hapsolur ve 36-44 cm'ye ulaşır
-  if (!has('sünger') && !has('dönüşüm')) {
-    // Çukurda birikme faktörü
-    roadDepth = Math.max(roadDepth, 36.5);
-  } else if (has('sünger') && has('dönüşüm')) {
-    roadDepth = Math.min(roadDepth, 12.0); // Güvenli sınır altı (30 cm)
-  } else if (has('sünger')) {
-    roadDepth = Math.min(roadDepth, 18.5); // Güvenli sınır altı
-  } else if (has('dönüşüm')) {
-    roadDepth = Math.min(roadDepth, 22.0); // Güvenli sınır altı
-  }
-
-  hospitalRoadCell.waterDepth = Math.round(roadDepth * 10) / 10;
+  const roadDepth = Math.max(0, Math.round(hospitalRoadCell.waterDepth * 10) / 10);
+  hospitalRoadCell.waterDepth = roadDepth;
   const isPassable = roadDepth <= prev.hospitalRoadThreshold;
+  const previousMetrics = prev.metrics;
+  const metrics: SpatialSimulationMetrics = {
+    cumulativeRainInput: previousMetrics.cumulativeRainInput + rainInput * Object.keys(prev.cells).length,
+    cumulativeInfiltration: previousMetrics.cumulativeInfiltration + infiltrationTotal,
+    cumulativeDrainage: previousMetrics.cumulativeDrainage + drainageTotal,
+    cumulativeOutflow: previousMetrics.cumulativeOutflow + externalOutflow,
+    spongeCapturedWater,
+    spongePeakStorage: Math.max(previousMetrics.spongePeakStorage, spongeStorage),
+    peakHospitalRoadWaterDepth: Math.max(previousMetrics.peakHospitalRoadWaterDepth, roadDepth),
+    timeAboveRoadThreshold: previousMetrics.timeAboveRoadThreshold + (roadDepth > prev.hospitalRoadThreshold ? FIXED_SIMULATION_STEP_SECONDS : 0),
+  };
 
-  // 4. Durum Olayları Tetikleme (Olay akışı)
+  // 5. Durum Olayları Tetikleme (Olay akışı)
   if (!isPassable && prev.hospitalRoadPassable) {
     newEvents.push({
       id: `hosp-blocked-${nextTick}`,
@@ -380,12 +500,18 @@ export function stepSpatialSimulation(
     events: newEvents,
     selectedDefenses,
     isCompleted: nextTick >= prev.maxTicks,
+    spongeStorage: Math.round(spongeStorage * 10) / 10,
+    spongeStorageCapacity: SPONGE_STORAGE_CAPACITY_CM,
+    spongeDeploymentTicksRemaining,
+    spongeOperational,
+    roadWetness: Math.min(1, Math.max(roadDepth / 36.5, prev.roadWetness * 0.94)),
+    metrics,
   };
 }
 
 /**
  * Belirli bir savunma setiyle tüm simülasyonu sonuna kadar çalıştırır
- * ve sonuç durumunu döndürür (Replay ve CityMemory karşılaştırmaları için).
+ * ve sonuç durumunu döndürür (saha simülasyonu ve sonuç ekranı karşılaştırmaları için).
  */
 export function runCompleteSpatialSimulation(selectedDefenses: DefenseId[] = []): SpatialSimulationState {
   let state = createInitialSpatialState(selectedDefenses);
@@ -393,4 +519,18 @@ export function runCompleteSpatialSimulation(selectedDefenses: DefenseId[] = [])
     state = stepSpatialSimulation(state, selectedDefenses);
   }
   return state;
+}
+
+export function compareSpatialScenarios(
+  selectedDefenses: DefenseId[] = ['sünger'],
+): SpatialScenarioComparison {
+  const baseline = runCompleteSpatialSimulation([]);
+  const intervention = runCompleteSpatialSimulation(selectedDefenses);
+  return {
+    baseline,
+    intervention,
+    peakDepthDifference: baseline.metrics.peakHospitalRoadWaterDepth - intervention.metrics.peakHospitalRoadWaterDepth,
+    timeAboveThresholdDifference: baseline.metrics.timeAboveRoadThreshold - intervention.metrics.timeAboveRoadThreshold,
+    finalDepthDifference: baseline.hospitalRoadWaterDepth - intervention.hospitalRoadWaterDepth,
+  };
 }

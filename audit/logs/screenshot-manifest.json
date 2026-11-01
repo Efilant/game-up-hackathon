@@ -1,0 +1,146 @@
+[
+  {
+    "file": "01_main_menu.png",
+    "bytes": 1438648,
+    "status": "CAPTURED",
+    "note": "Ana menü"
+  },
+  {
+    "file": "02_hero_selection_female.png",
+    "bytes": 165893,
+    "status": "CAPTURED",
+    "note": "Kadın kahraman seçimi"
+  },
+  {
+    "file": "03_hero_selection_male.png",
+    "bytes": 130529,
+    "status": "CAPTURED",
+    "note": "Erkek kahraman seçimi"
+  },
+  {
+    "file": "04_town_spawn.png",
+    "bytes": 129290,
+    "status": "CAPTURED",
+    "note": "Dünya spawn"
+  },
+  {
+    "file": "05_female_hero_movement.png",
+    "bytes": 160506,
+    "status": "CAPTURED",
+    "note": "Klavye/diagonal hareket çekimi"
+  },
+  {
+    "file": "06_male_hero_movement.png",
+    "bytes": 161592,
+    "status": "CAPTURED",
+    "note": "Erkek kahraman hareketi"
+  },
+  {
+    "file": "07_compass_navigation.png",
+    "bytes": 161185,
+    "status": "CAPTURED",
+    "note": "Compass hedefi"
+  },
+  {
+    "file": "08_mira_npc_interaction.png",
+    "bytes": 148329,
+    "status": "CAPTURED",
+    "note": "Mira etkileşim alanı"
+  },
+  {
+    "file": "09_mira_dialogue.png",
+    "bytes": 190110,
+    "status": "CAPTURED",
+    "note": "Mira diyaloğu"
+  },
+  {
+    "file": "10_drain_inspection.png",
+    "bytes": 162740,
+    "status": "CAPTURED",
+    "note": "Drenaj hedefi"
+  },
+  {
+    "file": "10_drain_inspection_dialogue.png",
+    "bytes": 214926,
+    "status": "CAPTURED",
+    "note": "Drenaj raporu"
+  },
+  {
+    "file": "11_aras_dialogue.png",
+    "bytes": 163731,
+    "status": "CAPTURED",
+    "note": "Aras hedefi"
+  },
+  {
+    "file": "11_aras_dialogue_open.png",
+    "bytes": 191104,
+    "status": "CAPTURED",
+    "note": "Aras diyaloğu"
+  },
+  {
+    "file": "12_calm_weather.png",
+    "bytes": 158250,
+    "status": "CAPTURED",
+    "note": "Fırtına öncesi hava"
+  },
+  {
+    "file": "13_rain_start.png",
+    "bytes": 177982,
+    "status": "CAPTURED",
+    "note": "Gözlem alanı"
+  },
+  {
+    "file": "13_rain_start_dialogue.png",
+    "bytes": 225811,
+    "status": "CAPTURED",
+    "note": "Yağmur başlangıcı"
+  },
+  {
+    "file": "14_heavy_rain.png",
+    "bytes": 222202,
+    "status": "CAPTURED",
+    "note": "Şiddetli yağmur"
+  },
+  {
+    "file": "15_flooded_hospital_road.png",
+    "bytes": 230270,
+    "status": "CAPTURED",
+    "note": "Hastane yolu taşkını"
+  },
+  {
+    "file": "16_citizen_reactions.png",
+    "bytes": 229052,
+    "status": "CAPTURED",
+    "note": "Fırtına sırasında vatandaşlar"
+  },
+  {
+    "file": "17_defense_selection_unreached.png",
+    "bytes": 193878,
+    "status": "NOT VERIFIED",
+    "note": "Sünger Kent hedefi; ulaşılmadı"
+  },
+  {
+    "file": "18_defense_construction_unreached.png",
+    "bytes": 210098,
+    "status": "NOT VERIFIED",
+    "note": "Savunma yerine taşkın diyaloğu; ulaşılmadı"
+  },
+  {
+    "file": "19_after_intervention_unreached.png",
+    "bytes": 192665,
+    "status": "NOT VERIFIED",
+    "note": "Müdahale sonrası state üretilemedi"
+  },
+  {
+    "file": "21_mobile_gameplay.png",
+    "bytes": 72689,
+    "status": "CAPTURED",
+    "note": "390x844 mobil joystick"
+  },
+  {
+    "file": "22_mobile_dialogue_not_reached.png",
+    "bytes": 81109,
+    "status": "NOT VERIFIED",
+    "note": "Mobil hedef yarıçapına ulaşılamadı"
+  }
+]

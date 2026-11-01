@@ -1,0 +1,62 @@
+ M e2e/game.spec.ts
+ M e2e/world-visual.spec.ts
+ M index.html
+ M src/App.tsx
+ M src/Cinema.tsx
+ M src/CityScene.tsx
+ M src/ExplorableWorld.tsx
+ M src/ambientCitizens.ts
+ M src/audio.ts
+ M src/cinema.css
+ M src/navigation.test.ts
+ M src/navigation.ts
+ M src/pixelWorldRenderer.ts
+ M src/spatialSimulation.test.ts
+ M src/spatialSimulation.ts
+?? ASSET_CREDITS.md
+?? FELAKET_BENIM_GAME_AUDIT.zip
+?? FELAKET_BENIM_SOURCE_CODE.zip
+?? FINAL_RELEASE_REPORT.md
+?? FINAL_VISUAL_REVIEW.md
+?? GAME_DESIGN_FEEDBACK_REVIEW.md
+?? RELEASE_CHECKPOINT.md
+?? SEHRIN_YARINI_COMPLETE_GAMEPLAY_QA.zip
+?? SEHRIN_YARINI_FINAL_RELEASE_v1.0.zip
+?? SPONGE_CITY_VERIFICATION.md
+?? VIDEO_SHOT_PLAN.md
+?? VISUAL_ART_DIRECTION_DIAGNOSIS.md
+?? VISUAL_ART_DIRECTION_REVIEW.md
+?? audit/
+?? e2e/branding-assets.spec.ts
+?? e2e/chapter-completion.spec.ts
+?? e2e/city-districts.spec.ts
+?? e2e/interaction-feedback.spec.ts
+?? e2e/male-hero-completion.spec.ts
+?? e2e/mobile-360.spec.ts
+?? e2e/player-movement.spec.ts
+?? e2e/star-three-prepared.spec.ts
+?? e2e/star-two-strategy.spec.ts
+?? e2e/star-zero-failure.spec.ts
+?? e2e/weather-flood.spec.ts
+?? final-visual-review/
+?? gameplay-feedback-review/
+?? public/assets/achievements/
+?? public/assets/branding/
+?? public/assets/chapters/
+?? public/assets/ui/
+?? qa-final/
+?? release-qa/
+?? src/BrandLogo.tsx
+?? src/branding.test.ts
+?? src/branding.ts
+?? src/chapterProgress.test.ts
+?? src/chapterProgress.ts
+?? src/cityDistricts.test.ts
+?? src/cityDistricts.ts
+?? src/playerMovement.test.ts
+?? src/playerMovement.ts
+?? src/saveMigration.test.ts
+?? src/saveMigration.ts
+?? src/weather.test.ts
+?? src/weather.ts
+?? visual-art-review/

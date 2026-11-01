@@ -4,7 +4,9 @@
  * react dynamically to weather & flooding, and speak contextual speech bubbles.
  */
 
-import { type ObstacleBox, pointCollidesWithObstacle, pointInFloodedRoadZone } from './navigation';
+import { type ObstacleBox, pointCollidesWithObstacle, pointInFloodedRoadZone, type TerrainMask } from './navigation';
+import { pointInBlockedTerrain } from './playerMovement';
+import type { WeatherPhase } from './weather';
 
 export type CitizenType =
   | 'adult'
@@ -39,7 +41,7 @@ export interface AmbientCitizen {
   y: number;
   targetX: number;
   targetY: number;
-  homeDistrict: 'square' | 'hospital' | 'junction' | 'safe_haven';
+  homeDistrict: 'square' | 'hospital' | 'junction' | 'safe_haven' | 'coastal' | 'industrial';
   facing: 'down' | 'up' | 'left' | 'right';
   state: CitizenState;
   speed: number;
@@ -202,8 +204,40 @@ export const INTERACT_QUOTES: string[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// 3. BÖLGELERE GÖRE NPC DAĞILIM PLANI (12 NPC)
+// 3. BÖLGELERE GÖRE NPC DAĞILIM PLANI (16 NPC)
 // ---------------------------------------------------------------------------
+
+function createDistrictCitizen(input: {
+  id: string;
+  name: string;
+  type: CitizenType;
+  homeDistrict: 'coastal' | 'industrial';
+  x: number;
+  y: number;
+  palette: CitizenPalette;
+  quote: string;
+  waypoints: { x: number; y: number }[];
+}): AmbientCitizen {
+  return {
+    id: input.id,
+    name: input.name,
+    type: input.type,
+    x: input.x,
+    y: input.y,
+    targetX: input.waypoints[0].x,
+    targetY: input.waypoints[0].y,
+    homeDistrict: input.homeDistrict,
+    facing: 'right',
+    state: 'walk',
+    speed: 42,
+    waitTimer: 0,
+    walkCycle: 0,
+    palette: input.palette,
+    interactQuote: input.quote,
+    waypoints: input.waypoints,
+    currentWpIndex: 0,
+  };
+}
 
 export function createInitialAmbientCitizens(): AmbientCitizen[] {
   return [
@@ -556,6 +590,32 @@ export function createInitialAmbientCitizens(): AmbientCitizen[] {
       ],
       currentWpIndex: 0,
     },
+    // E. KIYI MAHALLESİ — liman ve sahil yürüyüşü
+    createDistrictCitizen({
+      id: 'coast_ferry_worker', name: 'Nehir', type: 'worker', homeDistrict: 'coastal', x: 420, y: 1110,
+      palette: { body: '#e0a45f', pants: '#293847', hair: '#5c3a21', accessory: '#48c7d9' },
+      quote: 'Liman seti sağlam kalırsa mahalleye zaman kazandırır.',
+      waypoints: [{ x: 420, y: 1110 }, { x: 560, y: 1120 }, { x: 640, y: 1180 }],
+    }),
+    createDistrictCitizen({
+      id: 'coast_fisher', name: 'Orhan', type: 'adult', homeDistrict: 'coastal', x: 280, y: 1172,
+      palette: { body: '#4fa89b', pants: '#34495e', hair: '#1e2227', accessory: '#d8b86f' },
+      quote: 'Deniz kabardığında suyu ilk burada hissederiz.',
+      waypoints: [{ x: 280, y: 1172 }, { x: 180, y: 1172 }, { x: 300, y: 1172 }],
+    }),
+    // F. SANAYİ KORİDORU — vardiya ve enerji hattı
+    createDistrictCitizen({
+      id: 'industry_shift_worker', name: 'Derya', type: 'worker', homeDistrict: 'industrial', x: 1120, y: 1010,
+      palette: { body: '#d19a66', pants: '#2c313a', hair: '#5c3a21', accessory: '#e5c07b' },
+      quote: 'Drenaj kanalı açık kalırsa vardiya güvenli geçer.',
+      waypoints: [{ x: 1120, y: 1010 }, { x: 1280, y: 1010 }, { x: 1360, y: 1080 }],
+    }),
+    createDistrictCitizen({
+      id: 'industry_technician', name: 'Mert', type: 'adult', homeDistrict: 'industrial', x: 1740, y: 1130,
+      palette: { body: '#61afef', pants: '#3e4451', hair: '#21252b', accessory: '#e06c75' },
+      quote: 'Trafo hattı ile su baskını aynı şakayı sevmez.',
+      waypoints: [{ x: 1740, y: 1130 }, { x: 1880, y: 1130 }, { x: 1840, y: 1240 }],
+    }),
   ];
 }
 
@@ -568,22 +628,26 @@ export function updateAmbientCitizens(
   dt: number,
   params: {
     stormActive: boolean;
+    weatherPhase?: WeatherPhase;
     roadWaterDepth: number;
     roadPassable: boolean;
     hasSpongeDefense: boolean;
     chapterWon?: boolean;
     obstacles: ObstacleBox[];
+    terrainMask?: TerrainMask;
     playerX: number;
     playerY: number;
   }
 ): void {
   const {
     stormActive,
+    weatherPhase = stormActive ? 'LIGHT_RAIN' : 'CLEAR',
     roadWaterDepth,
     roadPassable,
     hasSpongeDefense,
     chapterWon = false,
     obstacles,
+    terrainMask,
     playerX,
     playerY,
   } = params;
@@ -614,9 +678,15 @@ export function updateAmbientCitizens(
   } else if (roadWaterDepth >= 18) {
     currentDialogPool = SPEECH_FLOOD_RISING;
     situationUrgency = 'danger';
-  } else if (stormActive) {
+  } else if (weatherPhase === 'EXTREME_STORM' || stormActive && weatherPhase === 'HEAVY_RAIN') {
+    currentDialogPool = SPEECH_CRITICAL_PANIC;
+    situationUrgency = 'critical';
+  } else if (weatherPhase === 'HEAVY_RAIN' || weatherPhase === 'LIGHT_RAIN') {
     currentDialogPool = SPEECH_RAIN_START;
     situationUrgency = 'rain';
+  } else if (weatherPhase === 'RECOVERY') {
+    currentDialogPool = SPEECH_RECOVERY_SUCCESS;
+    situationUrgency = 'recovery';
   } else {
     currentDialogPool = SPEECH_CALM;
     situationUrgency = 'calm';
@@ -748,6 +818,11 @@ export function updateAmbientCitizens(
 
       // Check deep flood collision
       if (pointInFloodedRoadZone({ x: nextX, y: nextY }, roadWaterDepth)) {
+        collided = true;
+        c.state = 'react';
+      }
+
+      if (terrainMask && pointInBlockedTerrain({ x: nextX, y: nextY }, terrainMask, 8)) {
         collided = true;
         c.state = 'react';
       }

@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   calculateDistanceMeters,
   calculateBearingDeg,
+  calculateCompassBearing,
   getOffScreenIndicator,
   pointCollidesWithObstacle,
   pointInFloodedRoadZone,
   hasLineOfSight,
   findNavRoute,
+  isNavRouteTraversable,
   getEkoContextualHint,
   type ObstacleBox,
 } from './navigation';
@@ -34,6 +36,15 @@ describe('Smart Quest Navigation System', () => {
     expect(calculateBearingDeg(center, { x: 400, y: 500 })).toBeCloseTo(180, 1);
     // North = -90 deg
     expect(calculateBearingDeg(center, { x: 500, y: 400 })).toBeCloseTo(-90, 1);
+  });
+
+  it('calculates north-up compass bearings in all cardinal directions', () => {
+    const center = { x: 500, y: 500 };
+    expect(calculateCompassBearing(center, { x: 500, y: 400 })).toMatchObject({ angleDeg: 0, cardinal: 'N' });
+    expect(calculateCompassBearing(center, { x: 600, y: 500 })).toMatchObject({ angleDeg: 90, cardinal: 'E' });
+    expect(calculateCompassBearing(center, { x: 500, y: 600 })).toMatchObject({ angleDeg: 180, cardinal: 'S' });
+    expect(calculateCompassBearing(center, { x: 400, y: 500 })).toMatchObject({ angleDeg: 270, cardinal: 'W' });
+    expect(calculateCompassBearing(center, { x: 600, y: 400 }).cardinal).toBe('NE');
   });
 
   it('detects off-screen targets and clamps indicator to screen margins', () => {
@@ -108,6 +119,12 @@ describe('Smart Quest Navigation System', () => {
     for (const pt of floodedRoute) {
       expect(pointInFloodedRoadZone(pt, 45)).toBe(false);
     }
+  });
+
+  it('detects a route that crosses a flooded corridor as unsafe', () => {
+    const route = [{ x: 1100, y: 520 }, { x: 1300, y: 520 }];
+    expect(isNavRouteTraversable(route, [], 0)).toBe(true);
+    expect(isNavRouteTraversable(route, [], 45)).toBe(false);
   });
 
   it('EKO Hint engine produces relevant contextual warnings and tips', () => {
@@ -187,5 +204,22 @@ describe('Smart Quest Navigation System', () => {
     expect(route.length).toBeGreaterThanOrEqual(2);
     expect(route[0]).toEqual(start);
     expect(route[route.length - 1]).toEqual(target);
+  });
+
+  it('keeps the safe initial spawn connected to Mira with the full world collider set', () => {
+    const obstacles: ObstacleBox[] = [
+      { x: 1360, y: 240, w: 240, h: 180 },
+      { x: 1050, y: 180, w: 120, h: 88 },
+      { x: 1640, y: 220, w: 120, h: 88 },
+      { x: 620, y: 440, w: 70, h: 130 },
+      { x: 440, y: 320, w: 140, h: 100 },
+      { x: 440, y: 530, w: 150, h: 110 },
+      { x: 330, y: 400, w: 120, h: 90 },
+      { x: 1520, y: 880, w: 180, h: 130 },
+      { x: 1760, y: 920, w: 140, h: 110 },
+      { x: 260, y: 880, w: 160, h: 140 },
+    ];
+    const route = findNavRoute({ x: 700, y: 620 }, { x: 520, y: 470 }, obstacles, 0);
+    expect(isNavRouteTraversable(route, obstacles, 0)).toBe(true);
   });
 });

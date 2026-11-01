@@ -1,0 +1,15 @@
+ e2e/world-visual.spec.ts                           |   9 +-
+ src/ExplorableWorld.tsx                            | 567 ++++++++++++---------
+ src/ambientCitizens.ts                             |  11 +-
+ src/audio.ts                                       |  18 +
+ src/cinema.css                                     | 225 ++++++--
+ src/navigation.test.ts                             |  34 ++
+ src/navigation.ts                                  |  62 ++-
+ src/pixelWorldRenderer.ts                          | 390 +++++---------
+ src/spatialSimulation.ts                           |  13 +-
+ test-results/.last-run.json                        |   8 +-
+ .../error-context.md                               |  24 -
+ .../error-context.md                               |  24 -
+ .../error-context.md                               |  24 -
+ tsconfig.tsbuildinfo                               |   2 +-
+ 14 files changed, 793 insertions(+), 618 deletions(-)

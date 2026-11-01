@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xml:lang="en-US">
+  <id>tag:github.com,2008:/Efilant/game-up-hackathon/commits/main</id>
+  <link type="text/html" rel="alternate" href="https://github.com/Efilant/game-up-hackathon/commits/main"/>
+  <link type="application/atom+xml" rel="self" href="https://github.com/Efilant/game-up-hackathon/commits/main.atom"/>
+  <title>Recent Commits to game-up-hackathon:main</title>
+  <updated>2026-10-31T21:30:41Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/5bbf36c52a76d55215269c45443ca391943ccfac</id>
+    <link type="text/html" rel="alternate" href="https://github.com/Efilant/game-up-hackathon/commit/5bbf36c52a76d55215269c45443ca391943ccfac"/>
+    <title>
+        feat: implement spatial simulation and city UI
+    </title>
+    <updated>2026-10-31T21:30:41Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/61501799?s=30&amp;v=4"/>
+    <author>
+      <name>Efilant</name>
+      <uri>https://github.com/Efilant</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;feat: implement spatial simulation and city UI
+
+- Add Google Fonts for typography
+- Implement spatial simulation and interactive city map
+- Enable planning mode with defense placement tools
+- Configure dev server port and linting scripts
+- Add OpenGraph metadata tags&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/b6014acb3b74dd0f8cb6faa39ccc01e9b44b2e73</id>
+    <link type="text/html" rel="alternate" href="https://github.com/Efilant/game-up-hackathon/commit/b6014acb3b74dd0f8cb6faa39ccc01e9b44b2e73"/>
+    <title>
+        Initial playable Felaket Benim game
+    </title>
+    <updated>2026-10-30T23:31:48Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/61501799?s=30&amp;v=4"/>
+    <author>
+      <name>Efilant</name>
+      <uri>https://github.com/Efilant</uri>

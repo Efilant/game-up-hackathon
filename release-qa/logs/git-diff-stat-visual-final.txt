@@ -1,0 +1,16 @@
+ e2e/game.spec.ts              |    2 +-
+ e2e/world-visual.spec.ts      |   11 +-
+ index.html                    |   11 +-
+ src/App.tsx                   |    8 +-
+ src/Cinema.tsx                |   59 +-
+ src/CityScene.tsx             |    2 +-
+ src/ExplorableWorld.tsx       | 1186 ++++++++++++++++++++++++++++++-----------
+ src/ambientCitizens.ts        |   73 ++-
+ src/audio.ts                  |   26 +
+ src/cinema.css                |  601 +++++++++++++++++++--
+ src/navigation.test.ts        |   34 ++
+ src/navigation.ts             |   62 ++-
+ src/pixelWorldRenderer.ts     |  844 ++++++++++++++++++++---------
+ src/spatialSimulation.test.ts |   48 +-
+ src/spatialSimulation.ts      |  246 +++++++--
+ 15 files changed, 2527 insertions(+), 686 deletions(-)

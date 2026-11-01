@@ -1,0 +1,21 @@
+{
+  "title": "ŞEHRİN YARINI — Official 120-second trailer",
+  "duration_seconds": 120,
+  "fps": 30,
+  "resolution": "1920x1080",
+  "segments": [
+    {"start": 0, "duration": 5, "source": "real-main-menu.png", "purpose": "title / city premise"},
+    {"start": 5, "duration": 5, "source": "real-character-selection.png", "purpose": "choose Deniz or Barış"},
+    {"start": 10, "duration": 5, "source": "real-rpg-spawn.png", "purpose": "enter the living city"},
+    {"start": 15, "duration": 5, "source": "real-rpg-quest.png", "purpose": "objective and exploration"},
+    {"start": 20, "duration": 5, "source": "real-flood-simulation.png", "purpose": "storm and rising water"},
+    {"start": 25, "duration": 5, "source": "real-planning-journal.png", "purpose": "decision / city protection plan"},
+    {"start": 30, "duration": 90, "source": "real-gameplay-90s.webm", "purpose": "real browser gameplay capture"}
+  ],
+  "audio": {
+    "voice": "audio/voiceover.aiff",
+    "bed": "audio/original_ambient_bed.wav",
+    "voice_status": "temporary macOS Yelda Turkish TTS; replace with human recording before public release"
+  },
+  "captions": "subtitles/trailer_tr.srt"
+}

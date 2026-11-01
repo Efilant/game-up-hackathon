@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  compareSpatialScenarios,
   createInitialSpatialState,
   runCompleteSpatialSimulation,
   stepSpatialSimulation,
@@ -16,8 +17,10 @@ describe('Mekânsal Taşkın ve Hastane Yolu Simülasyonu', () => {
 
   it('savunmasız senaryoda fırtına sırasında hastane erişim yolu su altında kalır (> 30 cm)', () => {
     const result = runCompleteSpatialSimulation([]);
-    expect(result.hospitalRoadWaterDepth).toBeGreaterThan(30);
-    expect(result.hospitalRoadPassable).toBe(false);
+    expect(result.metrics.peakHospitalRoadWaterDepth).toBeGreaterThan(30);
+    expect(result.metrics.timeAboveRoadThreshold).toBeGreaterThan(0);
+    expect(result.hospitalRoadWaterDepth).toBeLessThan(result.metrics.peakHospitalRoadWaterDepth);
+    expect(result.hospitalRoadPassable).toBe(true); // toparlanma penceresinde su çekilir
   });
 
   it('Sünger Kent veya Güvenli Dönüşüm yatırımı yapıldığında hastane yolu ulaşıma açık kalır (<= 30 cm)', () => {
@@ -44,8 +47,45 @@ describe('Mekânsal Taşkın ve Hastane Yolu Simülasyonu', () => {
   });
 
   it('Kıyı Seti liman rıhtımındaki su seviyesini düşürür', () => {
-    const withoutWall = runCompleteSpatialSimulation([]);
-    const withWall = runCompleteSpatialSimulation(['set']);
+    let withoutWall = createInitialSpatialState([]);
+    let withWall = createInitialSpatialState(['set']);
+    for (let i = 0; i < 20; i += 1) {
+      withoutWall = stepSpatialSimulation(withoutWall, []);
+      withWall = stepSpatialSimulation(withWall, ['set']);
+    }
     expect(withWall.cells['kiyi_rihtim'].waterDepth).toBeLessThan(withoutWall.cells['kiyi_rihtim'].waterDepth);
+  });
+
+  it('Sünger Kent yalnızca bağlı havzadan sınırlı miktarda su tutar ve pik taşkını azaltır', () => {
+    const comparison = compareSpatialScenarios(['sünger']);
+    expect(comparison.intervention.metrics.spongeCapturedWater).toBeGreaterThan(0);
+    expect(comparison.intervention.spongeStorage).toBeLessThanOrEqual(comparison.intervention.spongeStorageCapacity);
+    expect(comparison.intervention.metrics.peakHospitalRoadWaterDepth)
+      .toBeLessThan(comparison.baseline.metrics.peakHospitalRoadWaterDepth);
+    expect(comparison.peakDepthDifference).toBeGreaterThan(0);
+    expect(comparison.timeAboveThresholdDifference).toBeGreaterThanOrEqual(0);
+    for (const cell of Object.values(comparison.intervention.cells)) {
+      expect(cell.waterDepth).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it('Sünger Kent söndürüldüğünde su toparlanma penceresinde yeniden çekilebilir', () => {
+    let state = createInitialSpatialState(['sünger']);
+    for (let i = 0; i < 44; i += 1) state = stepSpatialSimulation(state, ['sünger']);
+    const peak = state.metrics.peakHospitalRoadWaterDepth;
+    while (!state.isCompleted) state = stepSpatialSimulation(state, ['sünger']);
+    expect(state.hospitalRoadWaterDepth).toBeLessThan(peak);
+    expect(state.hospitalRoadPassable).toBe(true);
+  });
+
+  it('basitleştirilmiş su bütçesi yağış, infiltrasyon, drenaj ve çıkışla dengelenir', () => {
+    const state = runCompleteSpatialSimulation(['sünger']);
+    const finalMass = Object.values(state.cells).reduce((sum, cell) => sum + cell.waterDepth, 0) + state.spongeStorage;
+    const accountedMass = state.metrics.cumulativeRainInput
+      - state.metrics.cumulativeInfiltration
+      - state.metrics.cumulativeDrainage
+      - state.metrics.cumulativeOutflow;
+    expect(finalMass).toBeGreaterThanOrEqual(0);
+    expect(Math.abs(finalMass - accountedMass)).toBeLessThan(12);
   });
 });

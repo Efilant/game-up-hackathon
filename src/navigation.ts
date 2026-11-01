@@ -17,6 +17,11 @@ export interface ObstacleBox {
   label?: string;
 }
 
+export interface TerrainMask {
+  blockedZones: ObstacleBox[];
+  walkableZones: ObstacleBox[];
+}
+
 export interface OffScreenIndicator {
   isOffScreen: boolean;
   screenX: number;
@@ -30,6 +35,13 @@ export interface EkoHint {
   title: string;
   hint: string;
   urgency: 'info' | 'warning' | 'success';
+}
+
+export interface CompassBearing {
+  /** 0° = north, 90° = east, 180° = south, 270° = west. */
+  angleDeg: number;
+  cardinal: 'N' | 'NE' | 'E' | 'SE' | 'S' | 'SW' | 'W' | 'NW';
+  distanceMeters: number;
 }
 
 // 10 pixels in game world = 1 meter in real world
@@ -51,6 +63,25 @@ export function calculateDistanceMeters(p1: Point2D, p2: Point2D): number {
 export function calculateBearingDeg(from: Point2D, to: Point2D): number {
   const rad = Math.atan2(to.y - from.y, to.x - from.x);
   return (rad * 180) / Math.PI;
+}
+
+/**
+ * Calculates a north-up RPG compass bearing from world coordinates.
+ * Screen Y grows downward, so atan2(dx, -dy) puts north at 0 degrees.
+ */
+export function calculateCompassBearing(from: Point2D, to: Point2D): CompassBearing {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const rawAngle = (Math.atan2(dx, -dy) * 180) / Math.PI;
+  const angleDeg = (rawAngle + 360) % 360;
+  const cardinalDirections: CompassBearing['cardinal'][] = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+  const cardinal = cardinalDirections[Math.round(angleDeg / 45) % cardinalDirections.length];
+
+  return {
+    angleDeg,
+    cardinal,
+    distanceMeters: calculateDistanceMeters(from, to),
+  };
 }
 
 /**
@@ -200,7 +231,15 @@ export const ROAD_NETWORK_NODES: Record<string, RoadNode> = {
   terrace_1280: { id: 'terrace_1280', x: 1280, y: 340, neighbors: ['terrace_1160', 'hosp_1380'] },
 
   // Historic Promenade & Climate Research Station
-  bazaar_promenade: { id: 'bazaar_promenade', x: 620, y: 620, neighbors: ['ave_550', 'blvd_550', 'bazaar_clock'] },
+  bazaar_promenade: {
+    id: 'bazaar_promenade',
+    x: 620,
+    y: 620,
+    neighbors: ['ave_550', 'blvd_550', 'bazaar_clock', 'bazaar_low'],
+  },
+  // Narrow safe passage between the museum and clock tower.
+  bazaar_low: { id: 'bazaar_low', x: 600, y: 620, neighbors: ['bazaar_promenade', 'bazaar_north'] },
+  bazaar_north: { id: 'bazaar_north', x: 600, y: 500, neighbors: ['bazaar_low', 'bazaar_clock'] },
   bazaar_clock: { id: 'bazaar_clock', x: 550, y: 470, neighbors: ['bazaar_promenade', 'research_station'] },
   research_station: { id: 'research_station', x: 520, y: 470, neighbors: ['bazaar_clock'] },
 };
@@ -217,7 +256,8 @@ export function hasLineOfSight(
   p1: Point2D,
   p2: Point2D,
   obstacles: ObstacleBox[],
-  roadWaterDepth: number
+  roadWaterDepth: number,
+  clearance = 14,
 ): boolean {
   const steps = 12;
   for (let i = 1; i < steps; i++) {
@@ -232,7 +272,7 @@ export function hasLineOfSight(
     }
 
     for (const obs of obstacles) {
-      if (pointCollidesWithObstacle(testPt, obs, 14)) {
+      if (pointCollidesWithObstacle(testPt, obs, clearance)) {
         return false;
       }
     }
@@ -261,7 +301,7 @@ export function findNavRoute(
     const node = ROAD_NETWORK_NODES[id];
     if (pointInFloodedRoadZone(node, roadWaterDepth)) return false;
     for (const obs of obstacles) {
-      if (pointCollidesWithObstacle(node, obs, 12)) return false;
+      if (pointCollidesWithObstacle(node, obs, 8)) return false;
     }
     return true;
   });
@@ -337,6 +377,7 @@ export function findNavRoute(
 
       const neighborNode = ROAD_NETWORK_NODES[neighborId];
       if (!neighborNode) continue;
+      if (!hasLineOfSight(currentNode, neighborNode, obstacles, roadWaterDepth, 8)) continue;
 
       const edgeDist = Math.hypot(neighborNode.x - currentNode.x, neighborNode.y - currentNode.y);
       const tentativeG = current.g + edgeDist;
@@ -361,6 +402,22 @@ export function findNavRoute(
 
   // Direct fallback
   return [start, ROAD_NETWORK_NODES[startNodeId], ROAD_NETWORK_NODES[targetNodeId], target];
+}
+
+/** Returns false when the computed route contains an obstacle or flooded crossing. */
+export function isNavRouteTraversable(
+  route: Point2D[],
+  obstacles: ObstacleBox[],
+  roadWaterDepth = 0,
+): boolean {
+  if (route.length < 2) return false;
+  for (let i = 1; i < route.length; i += 1) {
+    // Navigation nodes are road-center waypoints; use a zero-width visibility
+    // check here so a route beside a building is not reported as blocked merely
+    // because the player sprite needs a small clearance at runtime.
+    if (!hasLineOfSight(route[i - 1], route[i], obstacles, roadWaterDepth, 0)) return false;
+  }
+  return true;
 }
 
 
@@ -461,7 +518,7 @@ export function getEkoContextualHint(params: {
       return {
         speaker: 'EKO',
         title: 'NAVİGASYON AKTİF',
-        hint: `Altın rota izini takip et. Hedefe mesafe: ${distanceMeters} metre.`,
+        hint: `Pusuladaki hedef yönünü takip et. Hedefe mesafe: ${distanceMeters} metre.`,
         urgency: 'info',
       };
   }

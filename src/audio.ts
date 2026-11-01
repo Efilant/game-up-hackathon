@@ -1,3 +1,5 @@
+import type { WeatherPhase } from './weather';
+
 /** Call unlock() from a pointer/keyboard gesture. Other methods never create a context. */
 type Motif = { root: number; chord: number[]; melody: number[]; bass: number[]; beat: number };
 type Layer = {
@@ -37,6 +39,7 @@ export class GameAudio {
   private sfx = 0.65;
   private muted = false;
   private lastEffect = -Infinity;
+  private weatherPhase: WeatherPhase = 'CLEAR';
 
   unlock(): void {
     if (typeof window === 'undefined') return;
@@ -63,6 +66,7 @@ export class GameAudio {
       }
       this.effects = this.createLayer(this.sfxBus);
       this.startScene();
+      if (this.weatherPhase !== 'CLEAR') this.playWeatherCue(this.weatherPhase);
     }
     if (this.context.state === 'suspended') void this.context.resume().catch(() => {});
   }
@@ -86,6 +90,13 @@ export class GameAudio {
     this.sfxBus?.gain.setValueAtTime(this.sfx, now);
   }
 
+  setWeatherPhase(phase: WeatherPhase): void {
+    if (phase === this.weatherPhase) return;
+    this.weatherPhase = phase;
+    if (phase === 'EXTREME_STORM') this.effect('thunder');
+    else if (phase === 'LIGHT_RAIN' || phase === 'HEAVY_RAIN' || phase === 'RECOVERY') this.effect('rain');
+  }
+
   effect(kind = 'click'): void {
     const context = this.context;
     const layer = this.effects;
@@ -99,6 +110,16 @@ export class GameAudio {
       [48, 55, 62].forEach((note,i)=>this.tone(layer,note,now+i*.12,.7,.055,'sine',.08));
     } else if (kind === 'investment') {
       [69, 76].forEach((note,i)=>this.tone(layer,note,now+i*.08,.22,.09,'triangle'));
+    } else if (kind === 'star') {
+      [76, 81, 88].forEach((note, i) => this.tone(layer, note, now + i * 0.055, 0.24, 0.075, 'sine'));
+    } else if (kind === 'achievement') {
+      [72, 79, 84, 91].forEach((note, i) => this.tone(layer, note, now + i * 0.07, 0.34, 0.075, 'triangle'));
+    } else if (kind === 'ending-victory') {
+      [60, 67, 72, 76, 79].forEach((note, i) => this.tone(layer, note, now + i * 0.12, 0.6, 0.06, 'sine'));
+    } else if (kind === 'ending-failure') {
+      [52, 48, 45].forEach((note, i) => this.tone(layer, note, now + i * 0.14, 0.5, 0.055, 'triangle'));
+    } else if (/rain|splash/.test(kind)) {
+      this.weather(layer, now, 0.8);
     } else if (/success|victory|win/.test(kind)) {
       [72, 76, 79, 84].forEach((note, i) => this.tone(layer, note, now + i * 0.09, 0.4, 0.1, 'sine'));
     } else if (/error|fail|damage/.test(kind)) {
@@ -196,6 +217,11 @@ export class GameAudio {
   private rumble(layer: Layer, at: number, duration: number): void {
     this.weather(layer, at, duration);
     this.tone(layer, 27, at, duration, 0.18, 'sine', 0.15);
+  }
+
+  private playWeatherCue(phase: WeatherPhase): void {
+    if (phase === 'EXTREME_STORM') this.effect('thunder');
+    else if (phase !== 'CLEAR') this.effect('rain');
   }
 
   private startScene(): void {
